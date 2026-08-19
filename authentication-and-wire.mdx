@@ -1,6 +1,6 @@
 ---
 title: "Authentication and canonical wire"
-description: "Create Tiny-v1 credentials and encode strict v7 frames."
+description: "Create Tiny-v1 credentials and encode strict v8 frames."
 icon: "key"
 ---
 
@@ -19,7 +19,7 @@ Authorization: Tiny-v1 <hex-encoded-canonical-auth-frame>
 The decoded bytes are exactly:
 
 ```json
-{"version":7,"type":"auth","body":{"account":"42","expires_at":"1730000000000000000","key_id":1,"cancel_on_disconnect_ms":0,"sig":"<128-lowercase-hex>"}}
+{"version":8,"type":"auth","body":{"account":"42","expires_at":"1730000000000000000","key_id":1,"cancel_on_disconnect_ms":0,"sig":"<128-lowercase-hex>"}}
 ```
 
 The signature is HMAC-SHA512 over:
@@ -35,7 +35,11 @@ tokens can subscribe to and trade for multiple ledger-known accounts.
 <Note>
 `cancel_on_disconnect_ms` is intentionally outside the HMAC message. It is
 session policy: `0` disables the sweep; otherwise the accepted range is
-`3000..=600000` milliseconds.
+`3000..=600000` milliseconds. On a client session the window protects the
+token's own account; on an operator session the one window on the auth
+covers every account the session goes on to `listen` — see
+[the multi-strategy runner model](/multi-strategy) for the full sweep
+semantics.
 </Note>
 
 ## REST authority

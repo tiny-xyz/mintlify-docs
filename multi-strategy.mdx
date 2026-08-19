@@ -1,0 +1,135 @@
+---
+title: "Running more than one strategy"
+description: "One operator session anchors liveness and dead-runner protection for every strategy."
+---
+
+The venue has no strategy concept — the **account** is the unit of
+everything: funds, risk, resting orders, and the cancel-on-disconnect
+sweep. That gives a clean isolation rule and one operational pattern.
+
+## Rule one: one account per strategy
+
+A sweep, a `cancel_all`, and a balance are all account-wide. If two
+strategies share an account, they share fate: one strategy's
+disconnect protection clears the other's orders, and their PnL is
+indistinguishable. Give each strategy its own account; the operator
+plane below makes the fan-out cheap.
+
+## The shape: one operator session, N trading accounts
+
+A runner driving N strategies runs:
+
+- **One operator WS session** — authenticated with an operator-scope
+  token — that `listen`s every trading account. This single
+  connection is the runner's liveness anchor and its event feed:
+  order lifecycle, fills, fees, and balance events for every listened
+  account arrive here, each frame tagged with its account.
+- **REST for trading** — orders and cancels are per-request
+  authenticated (`Authorization: Tiny-v1 HEX` with each account's own
+  token), so N strategies trade concurrently over plain HTTP with no
+  per-account socket to keep alive.
+
+One connection to keep alive, one place to read events, N accounts
+trading.
+
+### Listening is batched
+
+`listen` takes up to **10 accounts per frame** — distinct, nonzero:
+
+```json
+{"version":8,"type":"listen","body":{"accounts":["...01","...02","...03"]}}
+```
+
+Verdicts are **per account**, judged in frame order exactly as if the
+frame had arrived once per account: an unknown account mid-batch gets
+its own `listen_rejected` and voids nothing around it. An empty
+batch, an 11-account batch, or a duplicate rejects the frame shape
+itself (`bad_account_batch`). `unlisten` mirrors the batching.
+
+An admitted listen answers with the account's own baseline bracket —
+`snapshot_begin`, the account's orders/positions/balance rows,
+`snapshot_end` — and that closing `snapshot_end` **is** the
+subscribed confirmation: from then on every event for the account
+routes to the session, tagged with its address. Reconcile from the
+bracket, then trust the stream.
+
+The 10-account cap is the frame budget, not venue policy — a runner
+with more accounts pipelines more frames. Listens bill the
+*operator's* rate allowance (not the watched accounts'), so a
+reconnecting runner re-listens hundreds of accounts within a couple
+of rate windows.
+
+## One heartbeat for all of them
+
+The wire heartbeat is per connection — WS ping/pong on each socket,
+documented in [the trading WebSocket](/websocket-trading) — so the operator session is the only
+socket the runner must keep responsive. There is no per-account
+keepalive.
+
+Dead-runner protection rides the same session: the
+`cancel_on_disconnect_ms` on the **operator's auth** covers **every
+account it goes on to listen** — nothing rides the listen frames.
+
+## If the runner dies, every strategy's orders clear
+
+When the operator session ends and no reclaim happens inside the
+window, the venue sweeps **each listened account**: a venue-authored
+`cancel_all` per account, per-order `cancel_done` events with
+`cause: "session_lost"`, funds unlocked on confirmed remaining —
+journaled before publishing, so even a venue crash mid-sweep
+completes on recovery.
+
+The sweep conditions, per account — each is a deliberate handoff
+rule, not a loophole:
+
+| An account is swept only if... | Why |
+|---|---|
+| the dying session was its **last watcher** — no other operator listening, no live client WS session for it | protection hands off to a surviving watcher instead of firing under it |
+| it was still **listened** at the end — not explicitly `unlisten`ed earlier | unlisten is a live runner's choice to release an account, not a lapse |
+| it has at least one **open restable order** | an empty book arms nothing |
+
+Reconnecting inside the window and re-listening an account **disarms
+its pending sweep** — the runner reclaimed it. An account already
+armed when the operator unbinds keeps its standing deadline.
+
+Orders a strategy places over REST while its account's sweep is armed
+are **included** in the sweep when it fires — REST activity never
+counts as liveness.
+
+## The failure drill, end to end
+
+1. Runner holds one operator session (window, say, 10 000 ms) and has
+   listened accounts A, B, C. Strategies trade over REST.
+2. The runner process dies. The operator socket drops.
+3. The venue arms one deadline per listened account. The window is a
+   floor — never early.
+4. **Recovery path:** the runner restarts within 10 s, re-auths, and
+   re-listens A, B, C. Each admitted listen disarms that account's
+   sweep. Resting orders survived; the runner reconciles from its
+   snapshot bracket.
+5. **Death path:** no reclaim. At the first venue heartbeat at or
+   past each deadline, A, B, and C are each swept — every resting
+   order across all three accounts comes back as `cancel_done` with
+   `cause: "session_lost"`, and collateral unlocks.
+
+A restarted **venue** (not runner) drops armed deadlines with the
+sessions themselves; protection resumes when the runner re-auths and
+re-listens — so a runner's reconnect loop should always re-listen its
+full set, unconditionally.
+
+## Alternative: one client session per account
+
+Without operator scope, the same protection exists per account: each
+account's own WS session with a nonzero window arms when that
+account's **last** session closes. It works, but it is N sockets, N
+liveness domains, and N reconnect loops — the redundancy the operator
+plane exists to remove. Prefer it only for a single-strategy runner.
+
+## Verified live
+
+Every behavioral claim above is pinned by an end-to-end probe against
+the deployed one-box exchange: one operator session listening six
+accounts; its death swept every last-watcher account's book inside
+the window, while a live client session, a second operator's listen,
+an explicit unlisten, and a reconnect-plus-re-listen each kept their
+account's orders exactly as described.

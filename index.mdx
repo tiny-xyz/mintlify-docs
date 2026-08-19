@@ -1,6 +1,6 @@
 ---
 title: "Tiny Exchange internal docs"
-description: "The integration entry point for the draft v7 trading API."
+description: "The integration entry point for the draft v8 trading API."
 icon: "house"
 ---
 
@@ -9,7 +9,7 @@ single-owner risk core. Use these docs to build clients, reason about fees, and
 recover safely after disconnects or ambiguous responses.
 
 <Warning>
-The v7 API is a working draft for the bare-metal test phase. The Rust codec in
+The v8 API is a working draft for the bare-metal test phase. The Rust codec in
 `protocol/external` defines the accepted bytes. The OpenAPI document describes
 fields and behavior, but cannot express fixed JSON key order, whitespace bans,
 or byte-identical retry rules.
@@ -27,6 +27,9 @@ or byte-identical retry rules.
   </Card>
   <Card title="Private trading WebSocket" icon="lock" href="/websocket-trading">
     Authenticate, send commands, consume account events, and multiplex operators.
+  </Card>
+  <Card title="Multi-strategy runners" icon="layer-group" href="/multi-strategy">
+    Anchor N accounts on one operator session; understand the dead-runner sweep.
   </Card>
   <Card title="Public market-data WebSocket" icon="chart-line" href="/websocket-market-data">
     Subscribe to books and trades with gapless sequencing and snapshot recovery.

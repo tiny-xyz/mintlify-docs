@@ -24,6 +24,7 @@
             "group": "Trading integration",
             "pages": [
               "websocket-trading",
+              "multi-strategy",
               "websocket-market-data",
               "events-and-recovery",
               "fees"
@@ -33,7 +34,7 @@
       },
       {
         "tab": "API reference",
-        "openapi": "api/external/openapi-trading-v7-draft.yaml",
+        "openapi": "api/external/openapi-trading-v8-draft.yaml",
         "groups": [
           {
             "group": "Overview",

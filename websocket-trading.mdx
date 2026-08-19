@@ -22,7 +22,7 @@ already served an authenticated REST request refuses the upgrade.
     paths are not accepted.
   </Step>
   <Step title="Authenticate first">
-    The first text message must be the canonical v7 `auth` frame. Send the JSON
+    The first text message must be the canonical v8 `auth` frame. Send the JSON
     frame itself, not the hex-encoded `Tiny-v1` REST header value.
   </Step>
   <Step title="Wait for auth_ok">
@@ -42,7 +42,7 @@ already served an authenticated REST request refuses the upgrade.
 ## Authentication frame
 
 ```json
-{"version":7,"type":"auth","body":{"account":"42","expires_at":"1730000000000000000","key_id":1,"cancel_on_disconnect_ms":0,"sig":"<128-lowercase-hex>"}}
+{"version":8,"type":"auth","body":{"account":"42","expires_at":"1730000000000000000","key_id":1,"cancel_on_disconnect_ms":0,"sig":"<128-lowercase-hex>"}}
 ```
 
 The wire requires fixed key order, no whitespace, canonical quoted decimals,
@@ -61,8 +61,8 @@ The private codec accepts exactly seven client message types.
 | `cancel_order` | Client or operator | Cancel one exchange order ID |
 | `cancel_all` | Client or operator | Cancel the account's current open orders |
 | `modify_order` | Client or operator | Modify an order's price using a monotone `modify_seq` |
-| `listen` | Operator only | Subscribe to one account and request its baseline |
-| `unlisten` | Operator only | Stop one account subscription |
+| `listen` | Operator only | Subscribe up to 10 accounts per frame and request each baseline |
+| `unlisten` | Operator only | Stop up to 10 account subscriptions per frame |
 
 Sending `listen` or `unlisten` from a normal client session produces
 `bad_request` with reason `not_operator`. Sending them to a REST command route
@@ -98,9 +98,19 @@ for later absolute `balance` frames.
 
 An operator connection receives only the venue-board baseline at authentication:
 market cards bracketed by `snapshot_begin` and a venue-scope `snapshot_end`
-whose account is all zeroes. Each admitted `listen` then produces a separate
-account baseline. The account's `snapshot_end` confirms that subscription is
-live.
+whose account is all zeroes. `listen` carries an `accounts` array of 1..=10
+distinct 40-hex addresses — the grammar's one array. Each account is judged
+independently in frame order: one refused account (`listen_rejected` with
+`unknown_account` or `subscription_capacity`) never voids the others'
+admissions, while an empty, over-cap, or duplicate-bearing list refuses the
+frame shape itself as `bad_account_batch`. Each admitted account produces its
+own baseline bracket, and that account's `snapshot_end` confirms the
+subscription is live. The 10-account cap is the frame budget, not venue
+policy — subscribe more accounts by pipelining more frames; `listen` bills
+the operator's own rate allowance, never the watched account's.
+
+Running several strategies from one process? [The multi-strategy runner
+model](/multi-strategy) builds on exactly this surface.
 
 ## Server-to-client messages
 

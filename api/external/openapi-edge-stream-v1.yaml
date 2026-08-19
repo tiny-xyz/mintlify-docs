@@ -1,20 +1,5 @@
 # Tiny public WS stream — tiny-edge /v1/stream (OpenAPI 3.1).
 #
-# Schema 1.3: server_snapshot and the lifecycle delta gained the
-# required tick_step field — the market's price-grid step in 0.1 cent
-# units (additive — the server always sends it; null until an edge has
-# learned the market's grid). A same-state lifecycle delta may restate
-# once to carry a late-learned step to live sessions.
-#
-# Schema 1.2: the client vocabulary gained the per-market forms
-# client_sub_market / client_unsub_market (up to 8 pins per connection
-# beside the bare default-follow; the 9th distinct pin closes 1008).
-# Additive — bare sub/unsub are unchanged.
-#
-# Schema 1.1: server_snapshot gained the required settled_outcome and
-# settle_price fields (additive — the server always sends them); a
-# consumer validating against a vendored 1.0 copy must re-vendor.
-#
 # The colo read-side surface actually LIVE today: tiny-edge's WebSocket
 # stream (snapshot on subscribe, then gapless per-connection deltas),
 # served from cloned edge boxes behind Cloudflare. Authoritative prose
@@ -22,9 +7,8 @@
 # services/edge/tests/render.rs are the freeze — this file mirrors them
 # for tooling and must move in the same commit as any render change.
 #
-# Distinct from the cloud drafts (openapi-market-data-v1-draft.yaml is
-# the future Postgres-backed read API; openapi-trading-v7-draft.yaml is
-# order entry at the gateway). Conventions shared: strict JSON, integers
+# Distinct from openapi-trading-v8-draft.yaml (order entry at the
+# gateway). Conventions shared: strict JSON, integers
 # only, u64s as quoted decimal strings, bare numbers only for values
 # provably <= u32, floats never, snake_case. Prices are ticks on the
 # 0.1 cent grid (PAYOUT = 1000 ticks). Unit note: the trading API's

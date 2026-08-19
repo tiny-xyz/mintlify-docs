@@ -1,4 +1,4 @@
-# Tiny external trading API — OpenAPI 3.1 DRAFT for the bare-metal test phase.
+# Tiny external trading API — OpenAPI 3.1 DRAFT for the demo-fleet phase.
 #
 # NOT authoritative: protocol/external (tiny-protocol-external) is the codec and
 # docs/context/api.md is the reference. OpenAPI cannot express the strict
@@ -12,14 +12,14 @@
 openapi: 3.1.0
 info:
   title: Tiny external trading API
-  version: "7-draft"
+  version: "8-draft"
   description: >
     Client-facing surface of the gateway. REST for commands, WebSocket
     for events. All frames are strict canonical JSON with fixed key
     order, no whitespace, no floats; unknown/reordered/duplicate keys
-    reject. Client frames: {"version":7,"type":"<name>","body":{...}}.
+    reject. Client frames: {"version":8,"type":"<name>","body":{...}}.
     Server frames add the emission stamp between type and body:
-    {"version":7,"type":"<name>","ts_ms":"<wall-ms>","body":{...}} —
+    {"version":8,"type":"<name>","ts_ms":"<wall-ms>","body":{...}} —
     ts_ms is observability only ("0" = no stamp), never ordering
     (order by book_seq inside sequenced events).
     Frames over 552 bytes are refused before parsing. The wire is
@@ -80,7 +80,7 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/NewOrderFrame" }
             example:
-              version: 7
+              version: 8
               type: new_order
               body:
                 salt: "7"
@@ -143,7 +143,7 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/CancelOrderFrame" }
             example:
-              version: 7
+              version: 8
               type: cancel_order
               body:
                 account: "000000000000000000000000000000000000002a"
@@ -177,7 +177,7 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/CancelAllFrame" }
             example:
-              version: 7
+              version: 8
               type: cancel_all
               body:
                 salt: "7"
@@ -206,7 +206,7 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/ModifyOrderFrame" }
             example:
-              version: 7
+              version: 8
               type: modify_order
               body:
                 account: "000000000000000000000000000000000000002a"
@@ -241,8 +241,9 @@ paths:
 
         Operator sessions (token resolved by the venue-deployed operator
         key store — never client-reachable) speak the same duplex frames
-        plus the subscription vocabulary: listen/unlisten, one 40-hex
-        account each. The connect baseline is the venue board alone
+        plus the subscription vocabulary: listen/unlisten, each naming
+        1..=10 distinct 40-hex accounts judged independently in frame
+        order. The connect baseline is the venue board alone
         (market cards bracketed by snapshot_begin and the zero-address
         snapshot_end); no account's events arrive until a listen. An
         admitted listen answers the account's own baseline bracket —
@@ -300,7 +301,7 @@ components:
       description: >
         "Tiny-v1 <hex>" where <hex> is the hex encoding of the full
         canonical auth frame:
-        {"version":7,"type":"auth","body":{"account":"<u64>","expires_at":"<wall-ns>","key_id":<u16>,"cancel_on_disconnect_ms":<u32>,"sig":"<128 hex>"}}
+        {"version":8,"type":"auth","body":{"account":"<u64>","expires_at":"<wall-ns>","key_id":<u16>,"cancel_on_disconnect_ms":<u32>,"sig":"<128 hex>"}}
         sig = HMAC-SHA512 over "tiny-auth-v1:<account>:<expires_at>:<key_id>"
         under the key file secret named by key_id. Mint tokens with
         tiny-gateway-keytool. Per-request; no cookies or server sessions.
@@ -409,7 +410,7 @@ components:
       type: object
       required: [version, type, body]
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: new_order }
         body:
           type: object
@@ -471,7 +472,7 @@ components:
         needs them signed; the session token is the authority.
       required: [version, type, body]
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: cancel_order }
         body:
           type: object
@@ -488,7 +489,7 @@ components:
         session token is the authority.
       required: [version, type, body]
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: cancel_all }
         body:
           type: object
@@ -506,7 +507,7 @@ components:
       type: object
       required: [version, type, body]
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: modify_order }
         body:
           type: object
@@ -525,41 +526,59 @@ components:
         WS-only, operator sessions only (a client session draws
         bad_request not_operator; on REST the frame matches no command
         door and draws bad_type). Subscribes the session to the named
-        account's events; the confirmation is the account's baseline
-        bracket, closed by a snapshot_end naming the account (see
-        /v1/ws). No sig: the operator token is the authority.
+        accounts' events — 1..=10 distinct addresses per frame, judged
+        independently in frame order exactly as if sent one per frame
+        (one refused account never voids the others). Per-account
+        confirmation is that account's baseline bracket, closed by a
+        snapshot_end naming it (see /v1/ws); per-account refusal is its
+        own listen_rejected. An empty, over-cap, or duplicate-carrying
+        list refuses as bad_request bad_account_batch. The cap is the
+        frame budget (at most 11 addresses fit in 552 bytes) — more
+        accounts means more frames, and the rate charge is per frame.
+        No sig: the operator token is the authority.
       required: [version, type, body]
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: listen }
         body:
           type: object
-          required: [account]
+          required: [accounts]
           properties:
-            account: { $ref: "#/components/schemas/Account" }
+            accounts:
+              type: array
+              minItems: 1
+              maxItems: 10
+              uniqueItems: true
+              items: { $ref: "#/components/schemas/Account" }
 
     UnlistenFrame:
       type: object
       description: >-
-        WS-only, operator sessions only. Stops the named account's
-        events (frames already queued may still drain); answers
-        unlisten_done, also when the account was never listened — the
-        goal state holds.
+        WS-only, operator sessions only. Stops the named accounts'
+        events (frames already queued may still drain) — the same
+        1..=10 batch shape as listen, judged per account in frame
+        order; each answers unlisten_done, also when the account was
+        never listened — the goal state holds.
       required: [version, type, body]
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: unlisten }
         body:
           type: object
-          required: [account]
+          required: [accounts]
           properties:
-            account: { $ref: "#/components/schemas/Account" }
+            accounts:
+              type: array
+              minItems: 1
+              maxItems: 10
+              uniqueItems: true
+              items: { $ref: "#/components/schemas/Account" }
 
     OrderSubmittedFrame:
       type: object
       description: The 202 body. order_id is the exchange identity for cancel/modify.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: order_submitted }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -583,7 +602,7 @@ components:
         cancel already landed — treat as success). At least one of
         salt / order_id is always nonzero.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: order_rejected }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -613,7 +632,7 @@ components:
     BadRequestFrame:
       type: object
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: bad_request }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -626,7 +645,8 @@ components:
                      reserved_id, reserved_market, price_out_of_range,
                      bad_disconnect_window,
                      zero_qty, zero_modify_seq, bad_kind_price,
-                     bad_kind_expiry, bad_settle_price, oversize_frame,
+                     bad_kind_expiry, bad_settle_price,
+                     bad_account_batch, oversize_frame,
                      unauthenticated, rate_limited, not_operator]
 
     ListenRejectedFrame:
@@ -638,7 +658,7 @@ components:
         no id the venue's ledger knows (also the answer for an account
         the venue will not serve). The account echoes verbatim.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: listen_rejected }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -653,7 +673,7 @@ components:
         The unlisten applied (or the account was never listened — same
         answer). Frames already queued behind the ack may still drain.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: unlisten_done }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -676,7 +696,7 @@ components:
         order's fills. qty echoes the ORIGINAL quantity — resting quantity
         is derived from fills, never carried.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: order_accepted }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -700,7 +720,7 @@ components:
         fill_index) is the globally unique fill identity: one taker
         command can produce N fills under one book_seq.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: fill }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -745,7 +765,7 @@ components:
         before the confirm reports requested, a fire landing first
         reports gtd_expired. Either is then true; informational only.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: cancel_done }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -764,7 +784,7 @@ components:
         NON-terminal: the order now rests at new_price with remaining qty
         (always >= 1 — a filled-out order's modify rejects instead).
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: modify_done }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -785,7 +805,7 @@ components:
         remaining always >= 1. Distinct from cancel_done so a client can
         tell "the window ended" from "my cancel landed".
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: order_expired }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -810,7 +830,7 @@ components:
         settle in batches, roughly 0.2-0.5 s after the fill and OUT OF
         ORDER across fills — never treat fill_settled as a watermark.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: fill_settled }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -832,7 +852,7 @@ components:
         facts are venue-frame (yes_won means YES holders were paid), never
         denormalized to your side's view.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: market_settled }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -851,7 +871,7 @@ components:
         The GET /v1/status body. mode "open" is the only word emitted
         today; "cancel_only" and "paused" are reserved.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: venue_status }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -875,7 +895,7 @@ components:
         advertised close in unix seconds ("0" = not announced),
         advisory only — gate order entry on state, never the clock.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: market_state }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -905,7 +925,7 @@ components:
         collateral is pledged position, not cash — do not read locked as
         covering it.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: snapshot_order }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -932,7 +952,7 @@ components:
         so insufficient_position is predictable from this frame).
         Emitted only for markets where the account holds any lots.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: snapshot_position }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -963,7 +983,7 @@ components:
         staleness, never correctness — the next one carries the whole
         truth.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: balance }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:
@@ -986,7 +1006,7 @@ components:
         at the snapshot — the baseline the live balance stream joins:
         discard any balance frame carrying a stamp at or below it.
       properties:
-        version: { const: 7 }
+        version: { const: 8 }
         type: { const: snapshot_balance }
         ts_ms: { $ref: "#/components/schemas/TsMs" }
         body:

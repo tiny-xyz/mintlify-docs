@@ -1,6 +1,6 @@
 ---
 title: "Trading API overview"
-description: "Transport boundaries, data model, and command lifecycle for v7 clients."
+description: "Transport boundaries, data model, and command lifecycle for v8 clients."
 icon: "diagram-project"
 ---
 
@@ -31,13 +31,13 @@ an event such as `order_accepted`, `fill`, `modify_done`, `cancel_done`, or
 Client frames contain `version`, `type`, then `body`:
 
 ```json
-{"version":7,"type":"cancel_order","body":{"account":"000000000000000000000000000000000000002a","market_id":"0000000000000000000000000000000000000000000000000000000000000005","order_id":"281474976710663"}}
+{"version":8,"type":"cancel_order","body":{"account":"000000000000000000000000000000000000002a","market_id":"0000000000000000000000000000000000000000000000000000000000000005","order_id":"281474976710663"}}
 ```
 
 Server frames insert `ts_ms` between `type` and `body`:
 
 ```json
-{"version":7,"type":"venue_status","ts_ms":"1730000000000","body":{"mode":"open"}}
+{"version":8,"type":"venue_status","ts_ms":"1730000000000","body":{"mode":"open"}}
 ```
 
 Frames are at most 552 bytes. Keys have a fixed order; whitespace, floats,
