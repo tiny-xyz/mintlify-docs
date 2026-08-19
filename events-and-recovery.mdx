@@ -1,0 +1,87 @@
+---
+title: "Events and recovery"
+description: "Apply snapshots and WebSocket events without double-counting or ordering bugs."
+icon: "rotate"
+---
+
+There is no event replay buffer. A reconnect rebuilds an absolute account
+baseline, then resumes live delivery.
+
+## Reconnect procedure
+
+<Steps>
+  <Step title="Discard connection-local assumptions">
+    Treat operator subscriptions and any incomplete snapshot bracket as gone.
+    Keep durable client facts such as exchange `order_id` and the original
+    bytes of still-retryable orders.
+  </Step>
+  <Step title="Fetch or receive a fresh snapshot">
+    `GET /v1/orders` returns NDJSON. A WebSocket authentication also stages the
+    same baseline. Read from `snapshot_begin` through `snapshot_end` and verify
+    the advertised counts.
+  </Step>
+  <Step title="Replace absolute state">
+    Rebuild open orders, positions, market cards, and the three balance
+    buckets. Do not merge a partial bracket into the previous baseline.
+  </Step>
+  <Step title="Resume live events">
+    Apply order events by identity, fills by their global fill identity, and
+    balances only when their sequence is newer than the snapshot baseline.
+  </Step>
+</Steps>
+
+## Idempotency keys
+
+| State | Application rule |
+| --- | --- |
+| Fill | Deduplicate by `(market_id, book_seq, fill_index)` |
+| Order remaining | Assign the absolute `remaining` value; never subtract `qty` locally |
+| Position | Assign absolute `position_yes` and `position_no` from the fill |
+| Balance | Highest `balance_seq` wins; sequence numbers are increasing but not dense |
+| Market state | Apply the monotone lifecycle `created → open → closed → settled` |
+| Fill finality | Join `fill_settled` to the fill by `(market_id, book_seq, fill_index)` |
+
+`ts_ms` is wall-clock observability and never orders events. `fill_settled`
+events may arrive out of order across fills and are not watermarks.
+
+## Snapshot contents
+
+An account snapshot contains:
+
+- one `market_state` for each live market in the board baseline;
+- one `snapshot_order` per open restable order;
+- one `snapshot_position` per market with a nonzero position;
+- one `snapshot_balance` with `available`, `locked`, `pending_finality`, and
+  its `balance_seq` baseline;
+- a final `snapshot_end` whose counts must match the frames received.
+
+The three money buckets are all portfolio value, but only `available` can fund
+new orders. `pending_finality` is visible collateral released by fills that is
+not spendable until chain finality.
+
+## Terminal order events
+
+An order is terminal when any of these occurs:
+
+- a `fill` sets `remaining` to `"0"`;
+- `cancel_done` reports a released remainder;
+- `order_expired` reports the market-close sweep;
+- `order_rejected` identifies a failed new order or another terminal engine
+  refusal.
+
+A rejected modify is not terminal for the underlying order. `modify_done`
+changes only price and queue state; the exchange `order_id` and remaining
+quantity persist.
+
+## Balance timing around fills
+
+The gateway emits the causing event before its absolute `balance` frame. At a
+taker fill, the fee is charged immediately into the venue fee pot. Opening-leg
+price improvement and fee over-reserve, plus any net closing proceeds, enter
+`pending_finality`. A later `fill_settled` decomposes the promoted amount into
+`proceeds`, `price_improvement`, and `fee_refund`.
+
+<Tip>
+If a balance frame is missed, do not infer deltas from fills. The next newer
+balance frame restates the complete three-bucket truth.
+</Tip>

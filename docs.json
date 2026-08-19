@@ -1,72 +1,72 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Tiny Exchange Internal",
+  "description": "Internal integration and API documentation for Tiny Exchange.",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#16A394",
+    "light": "#2DD4BF",
+    "dark": "#0F766E"
   },
-  "favicon": "/favicon.svg",
   "navigation": {
-    "pages": [
+    "tabs": [
       {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
+        "tab": "Internal guides",
+        "groups": [
+          {
+            "group": "Start here",
+            "pages": [
+              "index",
+              "authentication-and-wire"
+            ]
+          },
+          {
+            "group": "Trading integration",
+            "pages": [
+              "websocket-trading",
+              "websocket-market-data",
+              "events-and-recovery",
+              "fees"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API reference",
+        "openapi": "api/external/openapi-trading-v7-draft.yaml",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "api-overview"
+            ]
+          },
+          {
+            "group": "Orders",
+            "pages": [
+              "POST /v1/orders",
+              "GET /v1/orders",
+              "POST /v1/modify",
+              "POST /v1/cancel",
+              "POST /v1/cancel-all"
+            ]
+          },
+          {
+            "group": "Private streaming and health",
+            "pages": [
+              "GET /v1/ws",
+              "GET /v1/status"
+            ]
+          },
+          {
+            "group": "Public market data",
+            "openapi": "api/external/openapi-edge-stream-v1.yaml",
+            "pages": [
+              "GET /v1/stream"
+            ]
+          }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
     ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
   }
 }

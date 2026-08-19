@@ -1,0 +1,156 @@
+---
+title: "Fees and collateral reserves"
+description: "Exact taker fee arithmetic, rounding, reserve sizing, and client-visible accounting."
+icon: "coins"
+---
+
+Fees are per-market, taker-only, and computed in integer micro-dollar base
+units. The market chooses `fee_rate_bps` at creation; the value is immutable,
+must be in `0..=1000`, and appears on every `market_state` card.
+
+<Warning>
+Only a zero fee rate produces a zero taker fee on a valid nonempty fill. When a
+nonzero raw fee is smaller than the 10-micro-dollar grain, Tiny Exchange
+charges one grain. This deliberately differs from the matched venue's
+sub-grain-zero behavior.
+</Warning>
+
+## Units
+
+| Name | Meaning |
+| --- | --- |
+| `t` | Fill price in integer ticks, `1..=999` |
+| `qty` | Fill quantity in whole lots |
+| `rate_bps` | Market fee rate in basis points, `0..=1000` |
+| Base unit | One micro-dollar, `$0.000001` |
+| Fee grain | `10` base units, `$0.00001` |
+| Winning payout | `1,000,000` base units per lot |
+
+## Taker charge
+
+The unrounded charge is the Polymarket-shaped schedule:
+
+```text
+fee = qty × rate × p × (1 - p)
+p   = t / 1000
+```
+
+In the implementation, the exact intermediate stays in
+`10^-4`-micro-dollar units so no division truncates early:
+
+```text
+raw_e4 = qty × rate_bps × t × (1000 - t)
+```
+
+The charge algorithm is:
+
+```text
+if raw_e4 == 0:
+    fee_micro = 0
+else if raw_e4 < 100_000:
+    fee_micro = 10
+else:
+    fee_micro = floor(raw_e4 / 100_000) × 10
+```
+
+The caller applies this function only when the fill's liquidity role is
+`taker`. Makers pay `0`, regardless of the market rate.
+
+### Worked charges
+
+| Quantity | Rate | Fill price | Raw fee | Charged fee |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 lots | 400 bps | 600 ticks | 96,000 µUSD | 96,000 µUSD (`$0.096`) |
+| 1 lot | 1 bps | 355 ticks | 22.8975 µUSD | 20 µUSD |
+| 1 lot | 1 bps | 500 ticks | 25 µUSD | 20 µUSD |
+| 1 lot | 1 bps | 999 ticks | 0.0999 µUSD | 10 µUSD minimum |
+| 1 lot | 400 bps | 999 ticks | 39.96 µUSD | 30 µUSD |
+| any | 0 bps | any valid fill | 0 | 0 |
+
+Fees are symmetric around the midpoint: `t` and `1000 - t` have the same
+charge before and after rounding.
+
+## Admission reserve
+
+Every order reserves enough fee collateral for the cash-backed opening lots,
+even if the order is expected to make. Fill liquidity is not known until
+execution, and an order or later price modification can take.
+
+The worst feasible fill price is the legal price nearest the 500-tick peak of
+`t × (1000 - t)`:
+
+```text
+buy:  worst_tick = min(limit, 500)
+sell: worst_tick = max(limit, 500)
+```
+
+For one opening lot, the gateway evaluates `raw_e4` at `worst_tick` and rounds
+up to the 10-micro-dollar grain:
+
+```text
+reserve_per_lot = ceil(raw_e4 / 100_000) × 10
+fee_reserve     = reserve_per_lot × opening_lots
+```
+
+The ceiling is load-bearing. It makes the reserve dominate the sum of actual
+floored-with-minimum fees across every legal fill slicing.
+
+### Worked reserves
+
+| Order | Rate | Worst tick | Reserve per opening lot |
+| --- | ---: | ---: | ---: |
+| Buy limit 990 | 400 bps | 500 | 10,000 µUSD |
+| Buy limit 300 | 400 bps | 300 | 8,400 µUSD |
+| Buy limit 300 | 401 bps | 300 | 8,430 µUSD |
+| Sell limit 100 | 400 bps | 500 | 10,000 µUSD |
+| Any valid limit | 0 bps | — | 0 |
+
+At 401 bps and 300 ticks, one lot's raw fee is 8,421 µUSD. Admission reserves
+8,430 µUSD, while a taker fill at that price charges 8,420 µUSD. The 10 µUSD
+difference becomes `fee_refund`.
+
+## Opening and closing lots
+
+Before locking cash, the gateway pledges any unreserved opposite position to
+the order as closing lots. The remainder is opening:
+
+```text
+opening_lots = order_qty - pledged_closing_lots
+required_cash = cost_lock(opening_lots) + fee_reserve(opening_lots)
+```
+
+- Opening taker fills fund their fee from the admission reserve. Unused reserve
+  becomes `fee_refund`.
+- Closing lots reserve neither cost nor fee. Their taker fee is deducted from
+  gross exit proceeds.
+- A mixed fill consumes closing lots first, then opening lots. Its single taker
+  charge uses the opening reserve slice first and takes any remainder from the
+  closing proceeds.
+- Maker fills charge zero and return the opening fill's entire reserve slice
+  through `fee_refund`.
+
+The `1000` bps cap keeps a closing fill's fee within its own proceeds, so a
+fully invested account can exit without adding cash. An arithmetic disagreement
+is a typed risk fault; the gateway never clamps a fee.
+
+## Client-visible accounting
+
+| Field | When emitted | Meaning |
+| --- | --- | --- |
+| `market_state.body.fee_rate_bps` | Snapshot and market updates | Immutable rate used for the market |
+| `fill.body.liquidity` | Every fill | Selects maker (`0`) versus taker charge |
+| `fill.body.fee` | Every fill | Fee charged now, quoted in micro-dollar base units |
+| `fill_settled.body.fee_refund` | Fill finality | Unused opening reserve promoted from `pending_finality` |
+| `balance.body.locked` | After money movement | Includes remaining order cost locks and fee reserves |
+| `balance.body.pending_finality` | After money movement | Includes fee refunds awaiting finality |
+
+Do not recompute portfolio balances from these components. Apply the newest
+absolute balance frame. Recompute fees only for audit and pre-trade estimation.
+
+## Source of truth and test coverage
+
+The arithmetic lives in `protocol/types/src/fees.rs` as `taker_fee` and
+`fee_reserve_per_lot`. Gateway property tests prove that reserve slices cover
+adversarial fill slicing, that every charge lands on the grain, and that money
+conservation includes the fee pot. Parity tests separately pin the deliberate
+sub-grain difference from the matched venue.

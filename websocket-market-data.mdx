@@ -1,0 +1,209 @@
+---
+title: "Public market-data WebSocket"
+description: "Books, trades, statistics, lifecycle, stale-state signaling, and gap recovery on /v1/stream."
+icon: "chart-line"
+---
+
+`GET /v1/stream` is the public, unauthenticated market-data stream served by
+edge. Each subscription begins with a full market snapshot and continues with
+absolute deltas on one gapless connection sequence.
+
+```text
+wss://ws.tiny-testing.xyz/v1/stream
+```
+
+This surface carries no account identities, order identities, authentication,
+or order entry.
+
+## Connect and subscribe
+
+<Steps>
+  <Step title="Upgrade the exact route">
+    Open an RFC 6455 WebSocket to `/v1/stream`. Query strings, absolute-form
+    targets, request bodies, and alternate paths are refused.
+  </Step>
+  <Step title="Send subscriptions">
+    Follow the venue default market, pin up to eight explicit market IDs, or do
+    both. Client messages are byte-exact canonical strings.
+  </Step>
+  <Step title="Replace state from each snapshot">
+    Every subscription and re-subscription answers with a complete snapshot of
+    that market before later deltas.
+  </Step>
+  <Step title="Enforce the connection sequence">
+    Every server message carries one quoted `seq`, starting at `"1"` and shared
+    by all markets on the connection. A gap means loss and requires a fresh
+    snapshot.
+  </Step>
+</Steps>
+
+## Client-to-server messages
+
+The application vocabulary contains exactly four messages.
+
+| Exact payload | Effect |
+| --- | --- |
+| `{"type":"sub"}` | Follow the venue's default market; re-send for a fresh snapshot |
+| `{"type":"sub","market_id":"N"}` | Pin market `N`; re-send for a fresh snapshot of that market |
+| `{"type":"unsub"}` | Clear the default follow and every explicit pin |
+| `{"type":"unsub","market_id":"N"}` | Remove only the explicit pin for market `N` |
+
+The payload must use fixed key order, no whitespace, and a canonical quoted
+decimal market ID: nonzero, no sign, no leading zeroes, and within `u32`.
+Anything else closes `1008`.
+
+One connection may hold up to eight explicit market pins in addition to the
+default follow. A ninth distinct pin closes `1008`. Pinning an unannounced
+market is legal and returns an empty snapshot; content begins if the market is
+later announced.
+
+Inbound data must be masked and assemble to at most 64 bytes. Fragmentation is
+legal, but the complete assembled message remains subject to the same cap.
+
+## Server-to-client messages
+
+Every application response is an unfragmented text frame carrying:
+
+- `type`: `snapshot`, `delta`, or `stale`;
+- `seq`: the gapless connection-wide quoted `u64`;
+- `market_id`: the frame's market as a quoted decimal, or `null` before any
+  market has been named.
+
+### Snapshot
+
+`type: "snapshot"` replaces the complete rendered state for one market.
+
+| Field | Application rule |
+| --- | --- |
+| `state` | `created`, `open`, `closed`, `settled`, or `null`; gate order entry on `open` |
+| `settled_outcome` | Resolution when settled: YES, NO, void, or settled at a price |
+| `settle_price` | Non-null only for a settled-at-price outcome |
+| `opened_at_ms`, `closes_at_ms` | Advisory wall-clock window; never ordering authority |
+| `tick_step` | Current price-grid step, or `null` until learned |
+| `bids` | Best-first descending absolute levels, at most 200 |
+| `asks` | Best-first ascending absolute levels, at most 200 |
+| `trades` | Newest-first recent trades, at most 200 |
+| `stats` | Complete statistics object |
+| `now_ms` | Edge wall clock at snapshot construction |
+
+Each level contains `price`, quoted `qty`, and `orders`. Trades contain
+`book_seq`, `fill_index`, `price`, `qty`, `taker_side`, and observational
+`ts_ms`.
+
+A snapshot normally means prices are live. If it is immediately followed by a
+`stale` frame on the same sequence chain, render the snapshot but flag it as
+not live.
+
+### Delta kinds
+
+`type: "delta"` is discriminated by `kind`.
+
+| Kind | Payload and application |
+| --- | --- |
+| `book` | `side`, `price`, `qty`, `orders`; overwrite the level, deleting it when `qty` is `"0"` |
+| `trade` | `book_seq`, `fill_index`, `price`, `qty`, `taker_side`, `ts_ms`; deduplicate by `(market_id, book_seq, fill_index)` |
+| `stats` | Replace the entire `stats` object |
+| `lifecycle` | Apply market `state`, settlement fields, and `tick_step` by the delta's own `market_id` |
+| `tick_step_change` | Replace `old_tick_step` with the strictly finer `new_tick_step` and rebuild price controls |
+
+Lifecycle deltas are venue-wide and can name a market other than the one a
+client is currently rendering—for example, a predecessor settling after its
+successor opened. Always key lifecycle state by the delta's `market_id`.
+
+A same-state lifecycle delta may legitimately restate the market once to carry
+a late-learned `tick_step`. A grid refinement never cancels resting orders:
+`new_tick_step` strictly divides the old step, so existing prices remain legal.
+
+### Stale
+
+`type: "stale"` means the upstream feed gapped or went quiet. It is
+connection-wide even though the frame carries the venue default market ID.
+Flag every market rendered by that connection as possibly behind.
+
+There is no `unstale` message. Each market clears independently when its next
+snapshot arrives.
+
+## Sequence and recovery algorithm
+
+```javascript
+const socket = new WebSocket("wss://ws.tiny-testing.xyz/v1/stream");
+let expected = 1n;
+let recovering = false;
+
+socket.addEventListener("open", () => {
+  socket.send('{"type":"sub"}');
+});
+
+socket.addEventListener("message", ({ data }) => {
+  const message = JSON.parse(data);
+  const received = BigInt(message.seq);
+
+  if (received !== expected) {
+    recovering = true;
+    socket.send('{"type":"sub"}');
+  }
+
+  expected = received + 1n;
+  if (recovering && message.type !== "snapshot") return;
+  if (message.type === "snapshot") recovering = false;
+  applyAbsoluteMessage(message);
+});
+```
+
+The re-subscription snapshot stays on the same sequence chain; it does not
+restart `seq`. After a socket close, reconnect and begin a new chain at `"1"`.
+There is no replay endpoint or secondary state fetch.
+
+For multiple pinned markets, a connection-sequence gap can hide a frame for any
+of them. Mark every rendered market unreliable and re-subscribe each required
+market until all replacement snapshots arrive. A `stale` signal is an upstream
+health verdict rather than client-side loss, but it likewise flags every
+rendered market until each receives its own snapshot.
+
+## Units and safe parsing
+
+| Value | Wire representation |
+| --- | --- |
+| Price | Bare integer ticks `1..=999` |
+| `fill_index`, order count, unique-trader count | Bare integers bounded within `u32` |
+| `seq`, quantities, `book_seq`, statistics totals, timestamps | Quoted decimal `u64`; parse as `BigInt` or an equivalent lossless integer |
+| `market_id` | Quoted decimal identity, or `null` |
+| `volume_tenths` | Tenths-of-a-cent scale; multiply by 1,000 for trading-API micro-dollar units |
+
+`ts_ms`, `opened_at_ms`, `closes_at_ms`, and `now_ms` are display or advisory
+time. They never order market facts.
+
+## Handshake refusals
+
+| HTTP result | Meaning |
+| --- | --- |
+| `400` | Smuggling-shaped request or invalid body headers |
+| `404` | Target is not the exact `/v1/stream` origin-form path |
+| `431` | More than 32 headers or request head exceeds 4 KiB |
+| `503` | Retryable capacity or readiness refusal; back off and reconnect |
+
+The complete upgrade head must arrive within roughly two seconds. A malformed
+RFC 6455 handshake, including a method other than `GET`, may be dropped by the
+WebSocket implementation without an HTTP status.
+
+## Close codes
+
+| Code | Meaning and recovery |
+| ---: | --- |
+| `1000` | Normal close or idle unsubscribed socket; reconnect if still needed |
+| `1001` | Liveness probe unanswered or a pinned market was evicted; reconnect |
+| `1002` | WebSocket protocol violation |
+| `1008` | Invalid application message or explicit pin limit exceeded |
+| `1009` | Assembled data message exceeded 64 bytes |
+| `1011` | Internal encode failure; reconnect |
+| `1013` | Control-rate or egress overload; back off and reconnect |
+
+Subscribed quiet sockets receive pings at roughly five-second cadence. Standard
+automatic pongs are sufficient. A peer that stops reading can be dropped after
+the write-stall deadline without receiving a close frame.
+
+## Deliberate omissions
+
+The public stream contains no counterparty, account, or order identity; no
+authentication; no trading commands; and no complete market directory. Market
+discovery comes from venue lifecycle announcements or an off-exchange directory.
