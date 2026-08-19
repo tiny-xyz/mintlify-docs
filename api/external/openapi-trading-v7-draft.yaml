@@ -1,0 +1,1004 @@
+# Tiny external trading API — OpenAPI 3.1 DRAFT for the bare-metal test phase.
+#
+# NOT authoritative: protocol/external (tiny-protocol-external) is the codec and
+# docs/context/api.md is the reference. OpenAPI cannot express the strict
+# canonical-JSON grammar (fixed key order, no whitespace, reject-never-
+# normalize, u64-as-quoted-string exactness) — treat every schema here as
+# "the fields and their meaning", and the crate as "the bytes".
+#
+# Working draft, committed. The public (non-trading) read surface is
+# the edge WebSocket feed (openapi-edge-stream-v1.yaml).
+
+openapi: 3.1.0
+info:
+  title: Tiny external trading API
+  version: "7-draft"
+  description: >
+    Client-facing surface of the gateway. REST for commands, WebSocket
+    for events. All frames are strict canonical JSON with fixed key
+    order, no whitespace, no floats; unknown/reordered/duplicate keys
+    reject. Client frames: {"version":7,"type":"<name>","body":{...}}.
+    Server frames add the emission stamp between type and body:
+    {"version":7,"type":"<name>","ts_ms":"<wall-ms>","body":{...}} —
+    ts_ms is observability only ("0" = no stamp), never ordering
+    (order by book_seq inside sequenced events).
+    Frames over 552 bytes are refused before parsing. The wire is
+    YES-frame only: side and price always speak the YES contract; a
+    client wanting NO exposure normalizes before building the frame
+    (buy NO at p = sell YES at 1000 - p). Every order command carries
+    the signer's chain address (account) and a 65-byte ECDSA signature
+    blob (sig) so the payload shape is settlement-ready; TODAY the
+    signature is carried and journaled but NOT verified — the session
+    token is the account authority, and a body account that disagrees
+    with it rejects wrong_account (on an operator session the body
+    account IS the effective account — see /v1/ws). Every
+    account-addressed server body opens with account, the same 40-hex
+    address shape clients submit: identity rides the frame, not the
+    socket, so one operator session can carry many accounts' events,
+    and a single-account client gets a free cross-check (its own
+    address echoed on every private frame; a mismatch is a
+    must-not-happen to alarm on). The frames carrying none are venue
+    facts (market_state, venue_status) and session-level frames
+    (auth_ok speaks its own account id, auth_failed, bad_request,
+    snapshot_begin); snapshot_end alone may carry the all-zero address,
+    as the venue-scope sentinel closing a board-only snapshot. TLS
+    terminates upstream (Cloudflare in prod, nothing in the test
+    phase); the gateway speaks plain HTTP.
+
+servers:
+  - url: http://{gateway-host}:{listen-port}
+    description: gateway listen address from ops/deploy/colo.toml
+    variables:
+      gateway-host:
+        default: localhost
+        description: Hostname or IP address of a gateway shell.
+      listen-port:
+        default: "8080"
+        description: HTTP listen port of the gateway shell.
+
+security:
+  - tinyAuth: []
+
+paths:
+  /v1/orders:
+    post:
+      summary: Submit a new order
+      description: >
+        202 means validated, funds (cost + worst-case fee) locked, and
+        published to the engine — NOT a fill or acceptance; the definitive
+        verdict rides the WS or snapshot polling. A retry is a
+        byte-identical resend of the frame: the gateway dedups on the exact
+        frame bytes, so the same bytes arriving again inside the frame's
+        valid_until window (from any session of the same account — a retry
+        after reconnect still dedups) replay the original order_submitted
+        and execute nothing; after the window they reject expired
+        (reconcile via snapshot, never resubmit blind); any changed byte is
+        a fresh order.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewOrderFrame" }
+            example:
+              version: 7
+              type: new_order
+              body:
+                salt: "7"
+                valid_until: "1730000000000000000"
+                account: "000000000000000000000000000000000000002a"
+                market_id: "0000000000000000000000000000000000000000000000000000000000000005"
+                side: buy
+                kind: gtc
+                reduce_only: false
+                price: 400
+                qty: "100"
+                expiry: "1730000030"
+                sig: "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      responses:
+        "202":
+          description: order_submitted — carries the exchange order_id (keep it; it is the identity for cancel/modify and survives gateway restarts).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderSubmittedFrame" }
+        "422": { $ref: "#/components/responses/Rejected" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/AuthFailed" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { description: Ingress saturated; retry. }
+        "504": { description: "Risk thread over budget. Command MAY have executed — retry as the SAME BYTES (in-window replay or expired, never a double execution), or reconcile via snapshot." }
+    get:
+      summary: Open-orders + balance snapshot (reconnect path)
+      description: >
+        NDJSON body, one frame per line: snapshot_begin, market_state per
+        live market (holdings or not), snapshot_order per open order (kind
+        always restable: gtc/post_only), snapshot_position per market where
+        the account holds any lots, snapshot_balance (single-currency:
+        available, locked, pending_finality, under the account's
+        balance_seq stamp — the live balance stream's baseline),
+        snapshot_end with counts —
+        verify them. There is no replay buffer:
+        reconcile state from here, then resubscribe the WS. Frame shapes:
+        SnapshotOrderFrame / SnapshotBalanceFrame in components.
+      responses:
+        "200":
+          description: Snapshot stream.
+          content:
+            application/x-ndjson:
+              schema:
+                description: One canonical frame per line, in order.
+                type: string
+        "401": { $ref: "#/components/responses/AuthFailed" }
+
+  /v1/cancel:
+    post:
+      summary: Cancel by exchange order id
+      description: >
+        Blind-forwarded — skips risk checks. 202 with NO body, sent only
+        after the durable command has published; the outcome (cancel_done or
+        order_rejected unknown_order) rides the WS. Retry freely: cancels
+        are idempotent (unknown_order on the second landing is success).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CancelOrderFrame" }
+            example:
+              version: 7
+              type: cancel_order
+              body:
+                account: "000000000000000000000000000000000000002a"
+                market_id: "0000000000000000000000000000000000000000000000000000000000000005"
+                order_id: "281474976710663"
+      responses:
+        "202": { description: Forwarded durably. No body. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/AuthFailed" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { description: Ingress saturated; retry. }
+        "504": { description: Unknown outcome — repeat the cancel or reconcile via snapshot. }
+
+  /v1/cancel-all:
+    post:
+      summary: Cancel every open order, account-wide
+      description: >
+        All markets in one request. The gateway expands its own open-order
+        view into per-market engine batches; the 202 (NO body) is sent
+        after the last batch has durably published — immediately when
+        nothing is open. One cancel_done (or order_rejected) per open
+        order rides the WS, exactly as if each had been cancelled singly.
+        Retry freely: the expansion re-reads the open set, and an order
+        placed after a cancel-all is never touched by its retry. Not a
+        standing instruction — orders racing in behind the expansion stay
+        open. An edge reject echoes the salt with the all-zero market_id
+        (the command names no market).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CancelAllFrame" }
+            example:
+              version: 7
+              type: cancel_all
+              body:
+                salt: "7"
+                account: "000000000000000000000000000000000000002a"
+      responses:
+        "202": { description: Every open order's cancel durably published (or nothing was open). No body. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/AuthFailed" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { description: Ingress saturated; retry. }
+        "504": { description: Unknown outcome — repeat the cancel-all or reconcile via snapshot. }
+
+  /v1/modify:
+    post:
+      summary: Price-only modify
+      description: >
+        Keeps id and qty (qty change = cancel + new). modify_seq is
+        client-managed and strictly increasing per order — a retried modify
+        with the same seq answers stale_modify, which means the original
+        applied. Same-price keeps queue position; price change re-queues;
+        modify-to-cross fills as taker. A collateral-increasing modify
+        re-checks funds (422 insufficient_funds).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ModifyOrderFrame" }
+            example:
+              version: 7
+              type: modify_order
+              body:
+                account: "000000000000000000000000000000000000002a"
+                market_id: "0000000000000000000000000000000000000000000000000000000000000005"
+                order_id: "281474976710663"
+                modify_seq: 1
+                new_price: 450
+                sig: "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      responses:
+        "202": { description: Forwarded durably. No body. Outcome (modify_done / order_rejected) rides the WS. }
+        "422": { $ref: "#/components/responses/Rejected" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/AuthFailed" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { description: Ingress saturated; retry. }
+        "504": { description: Unknown outcome — retry with the same modify_seq and reconcile from events. }
+
+  /v1/ws:
+    get:
+      summary: Event stream (WebSocket upgrade)
+      description: >
+        Open on a FRESH connection (a socket that served an authenticated
+        REST request refuses the upgrade). After upgrade, the FIRST text
+        frame must be the auth message; server answers auth_ok, then the
+        snapshot baseline (same sequence as GET /v1/orders), then events
+        one message per text frame: order_accepted, fill, order_rejected,
+        cancel_done, modify_done, order_expired, fill_settled,
+        market_settled, market_state, balance, listen_rejected,
+        unlisten_done, bad_request. Re-auth is refused (reconnect to
+        rotate). Backpressure closes with 1013; token expiry closes with
+        1008 — reconnect and snapshot.
+
+        Operator sessions (token resolved by the venue-deployed operator
+        key store — never client-reachable) speak the same duplex frames
+        plus the subscription vocabulary: listen/unlisten, one 40-hex
+        account each. The connect baseline is the venue board alone
+        (market cards bracketed by snapshot_begin and the zero-address
+        snapshot_end); no account's events arrive until a listen. An
+        admitted listen answers the account's own baseline bracket —
+        snapshot_begin, its orders/positions/balance rows, snapshot_end
+        naming the account with markets 0 — and that closing
+        snapshot_end IS the subscribed confirmation: the account's
+        events route to the session from then on, each tagged with its
+        address. Events landing while a bracket is staged absorb into
+        it (complete-baseline-first, per subscription); market_state
+        cards are venue facts and always deliver live. Re-listen after
+        a served bracket re-serves a fresh one; listens repeated while
+        one is staged collapse into it — pair confirmations per
+        subscription state, never per frame sent. unlisten answers
+        unlisten_done and stops the account's events. Subscriptions are
+        session state, never journaled: a reconnect starts from zero
+        and re-listens. Operator trading commands may name ANY
+        ledger-known account — the body's account is the effective
+        account (admission, funds, sanctions all judge it); WS only,
+        REST keeps per-request client-token authority. LISTEN BEFORE
+        TRADING an account: the direct order_submitted ack routes to
+        the submitting session, but engine verdicts route by ACCOUNT —
+        an operator trading an account it does not listen to never
+        hears its own command's fate. A listen or unlisten on a client
+        session draws bad_request not_operator. Rate charging: a
+        trading frame bills the body account; listen/unlisten bill the
+        operator's own auth identity.
+      responses:
+        "101": { description: Upgraded. }
+        "400": { description: "Not a fresh connection, or bad upgrade." }
+
+  /v1/status:
+    get:
+      summary: Venue status (unauthenticated)
+      security: []
+      description: >
+        Answers a venue_status frame; no token, no rate charge. mode is
+        "open" whenever a front answers at all: every front process
+        fail-stops with its command path, so a served response implies a
+        live core ("cancel_only" and "paused" are reserved words, not
+        yet emitted). Absence of an answer is the degraded signal.
+      responses:
+        "200":
+          description: venue_status frame.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VenueStatusFrame" }
+        "400": { description: bad_request — a GET with a body is refused. }
+
+components:
+  securitySchemes:
+    tinyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: >
+        "Tiny-v1 <hex>" where <hex> is the hex encoding of the full
+        canonical auth frame:
+        {"version":7,"type":"auth","body":{"account":"<u64>","expires_at":"<wall-ns>","key_id":<u16>,"cancel_on_disconnect_ms":<u32>,"sig":"<128 hex>"}}
+        sig = HMAC-SHA512 over "tiny-auth-v1:<account>:<expires_at>:<key_id>"
+        under the key file secret named by key_id. Mint tokens with
+        tiny-gateway-keytool. Per-request; no cookies or server sessions.
+        The token remains the account authority; the per-order sig field
+        is carried for the settlement-ready shape, not yet verified.
+        Which key store resolves key_id decides the session's scope for
+        its whole life: the client store (one token, one account) or
+        the venue-deployed operator store (subscription vocabulary +
+        cross-account trading; see /v1/ws) — nothing inside the token
+        chooses.
+        cancel_on_disconnect_ms is session policy OUTSIDE the signature
+        domain: 0 = no sweep (the default; minted frames carry 0), else
+        3000..=600000 ms (out of range rejects
+        bad_disconnect_window). On a WS auth it asks the venue
+        to cancel the account's resting orders when its last live WS
+        session ends and no successor authenticates within the window
+        (any successor disarms; the closing session's own window
+        governs; an account with nothing resting arms nothing; armed
+        deadlines do not survive a gateway restart). Swept orders
+        terminate as cancel_done with cause session_lost — a
+        reconnecting client can tell the protection fired from a cancel
+        it sent itself. Inert on REST presentations — REST has no
+        session lifecycle to watch. On an operator auth the window is
+        the same session-level opt-in scoped to the LISTENED SET: one
+        window covers every account the session listens to (nothing
+        rides the listen frames), each swept when the session unbinds
+        as that account's last watcher — no other operator listening,
+        no live client WS session, at least one open restable order;
+        an admitted listen disarms a pending sweep, and an account
+        already armed at unbind keeps its standing deadline.
+
+  responses:
+    Rejected:
+      description: order_rejected — edge refusal (funds, band, sanctions, capacity, wrong_account, …) or a synchronously relayed engine reject.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/OrderRejectedFrame" }
+    BadRequest:
+      description: bad_request — frame grammar/transport refusal.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/BadRequestFrame" }
+    AuthFailed:
+      description: auth_failed — bad_token / expired_token / unknown_key / sanctioned.
+    RateLimited:
+      description: >-
+        bad_request (rate_limited) — slow down. Carries a Retry-After
+        header naming the whole seconds until the limiter window turns
+        over (the table-full 503 deliberately does not: that is
+        capacity, not a window).
+
+  schemas:
+    U64String:
+      type: string
+      pattern: "^[1-9][0-9]{0,19}$"
+      description: u64 as a quoted decimal string (no leading zeros; 0 is a reserved sentinel, never legal in client input).
+    TsMs:
+      type: string
+      pattern: "^(0|[1-9][0-9]{0,19})$"
+      description: >-
+        Server-envelope emission stamp, wall-clock unix milliseconds as
+        a quoted decimal ("0" = no stamp). Observability only — never an
+        ordering key.
+    Price:
+      type: integer
+      minimum: 1
+      maximum: 999
+      description: YES price in ticks on the 0.1 cent grid; a winning lot pays $1 = 1,000,000 micro-dollar base units (one tick's cash value is 1000 base units). One tick = exactly 1000 parts-per-million on the settlement contract's grid.
+    Side:
+      type: string
+      enum: [buy, sell]
+      description: Side of the YES contract. NO is expressed by normalizing before building the frame, never named on the wire.
+    Kind:
+      type: string
+      enum: [gtc, post_only, ioc, fok, market]
+      description: kind "market" requires price exactly 0 (mapped to an extreme-priced IOC); all others require price 1..=999.
+    Account:
+      type: string
+      pattern: "^[0-9a-f]{40}$"
+      description: >-
+        The signer's 20-byte chain address, 40 lowercase hex chars, no
+        0x prefix. All-zero is reserved. Interim scheme until real chain
+        identities land: the canonical address embeds the u64 account id
+        big-endian in the last 8 bytes with zeros elsewhere, and it must
+        embed the session token's account (else wrong_account).
+    MarketKey:
+      type: string
+      pattern: "^[0-9a-f]{64}$"
+      description: >-
+        The market's 32-byte key, 64 lowercase hex chars — the settlement
+        contract's bytes32 shape. All-zero is reserved. Interim scheme:
+        the canonical key embeds the u32 market id big-endian in the last
+        4 bytes with zeros elsewhere; any other bytes reject
+        unknown_market.
+    OrderSig:
+      type: string
+      pattern: "^[0-9a-f]{130}$"
+      description: >-
+        65-byte ECDSA signature blob (r || s || v), 130 lowercase hex
+        chars. Carried and journaled verbatim; NOT verified today — send
+        any 130-hex value (zeros are fine). Becomes the EIP-712 order
+        signature when the settlement contract's typehash freezes,
+        without a wire change.
+
+    NewOrderFrame:
+      type: object
+      required: [version, type, body]
+      properties:
+        version: { const: 7 }
+        type: { const: new_order }
+        body:
+          type: object
+          required: [salt, valid_until, account, market_id, side, kind, reduce_only, price, qty, expiry, sig]
+          properties:
+            salt:
+              allOf: [{ $ref: "#/components/schemas/U64String" }]
+              description: >-
+                Client-chosen, nonzero — the correlation label echoed in
+                this order's events, and the future settlement digest's
+                uniqueness nonce. No ordering rule, no standalone dedup
+                role (the exact-frame dedup is the idempotency story);
+                use distinct salts per attempt.
+            valid_until:
+              allOf: [{ $ref: "#/components/schemas/U64String" }]
+              description: >-
+                Nanoseconds wall time, quoted decimal, nonzero — the
+                retry window's deadline. Refused at admission when
+                already past (expired) or more than the gateway's
+                validity ceiling ahead (validity_too_far; default 60 s,
+                inclusive). Pick "now + your retry budget".
+            account: { $ref: "#/components/schemas/Account" }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            side: { $ref: "#/components/schemas/Side" }
+            kind: { $ref: "#/components/schemas/Kind" }
+            reduce_only:
+              type: boolean
+              description: >-
+                Hard cap on the automatic netting: the order may only
+                reduce the position on its closing leg, never open the
+                other side — rejects insufficient_position when the
+                unpledged lots don't cover qty instead of pricing the
+                remainder in cash. Bare JSON boolean.
+            price:
+              type: integer
+              minimum: 0
+              maximum: 999
+              description: 1..=999, except exactly 0 when kind is market.
+            qty: { $ref: "#/components/schemas/U64String" }
+            expiry:
+              type: string
+              pattern: "^(0|[1-9][0-9]{0,19})$"
+              description: >-
+                Absolute order deadline, unix SECONDS, quoted decimal;
+                "0" = no expiry (rests until filled, cancelled, or the
+                market's close sweep). Nonzero only on gtc/post_only
+                (else bad_kind_expiry). Must sit past the gateway's
+                minimum horizon (expiry_too_soon), within its maximum
+                horizon (expiry_too_late), and before the market's close
+                (expiry_past_close). Executes as a timed cancel — the
+                order terminates with cancel_done, not a distinct expiry
+                event.
+            sig: { $ref: "#/components/schemas/OrderSig" }
+
+    CancelOrderFrame:
+      type: object
+      description: >-
+        No sig: cancels only reduce exposure, so no settlement artifact
+        needs them signed; the session token is the authority.
+      required: [version, type, body]
+      properties:
+        version: { const: 7 }
+        type: { const: cancel_order }
+        body:
+          type: object
+          required: [account, market_id, order_id]
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            order_id: { $ref: "#/components/schemas/U64String" }
+
+    CancelAllFrame:
+      type: object
+      description: >-
+        No sig, like cancel_order — cancels only reduce exposure; the
+        session token is the authority.
+      required: [version, type, body]
+      properties:
+        version: { const: 7 }
+        type: { const: cancel_all }
+        body:
+          type: object
+          required: [salt, account]
+          properties:
+            salt:
+              allOf: [{ $ref: "#/components/schemas/U64String" }]
+              description: >-
+                Client-chosen, nonzero — the correlation echoed by this
+                command's edge reject. Distinct attempts should use
+                distinct salts.
+            account: { $ref: "#/components/schemas/Account" }
+
+    ModifyOrderFrame:
+      type: object
+      required: [version, type, body]
+      properties:
+        version: { const: 7 }
+        type: { const: modify_order }
+        body:
+          type: object
+          required: [account, market_id, order_id, modify_seq, new_price, sig]
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            order_id: { $ref: "#/components/schemas/U64String" }
+            modify_seq: { type: integer, minimum: 1, description: Client-managed, strictly increasing per order. }
+            new_price: { $ref: "#/components/schemas/Price" }
+            sig: { $ref: "#/components/schemas/OrderSig" }
+
+    ListenFrame:
+      type: object
+      description: >-
+        WS-only, operator sessions only (a client session draws
+        bad_request not_operator; on REST the frame matches no command
+        door and draws bad_type). Subscribes the session to the named
+        account's events; the confirmation is the account's baseline
+        bracket, closed by a snapshot_end naming the account (see
+        /v1/ws). No sig: the operator token is the authority.
+      required: [version, type, body]
+      properties:
+        version: { const: 7 }
+        type: { const: listen }
+        body:
+          type: object
+          required: [account]
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+
+    UnlistenFrame:
+      type: object
+      description: >-
+        WS-only, operator sessions only. Stops the named account's
+        events (frames already queued may still drain); answers
+        unlisten_done, also when the account was never listened — the
+        goal state holds.
+      required: [version, type, body]
+      properties:
+        version: { const: 7 }
+        type: { const: unlisten }
+        body:
+          type: object
+          required: [account]
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+
+    OrderSubmittedFrame:
+      type: object
+      description: The 202 body. order_id is the exchange identity for cancel/modify.
+      properties:
+        version: { const: 7 }
+        type: { const: order_submitted }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            salt: { $ref: "#/components/schemas/U64String" }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            order_id: { $ref: "#/components/schemas/U64String" }
+
+    OrderRejectedFrame:
+      type: object
+      description: >
+        Sentinel-disciplined identity: salt nonzero with a nonzero
+        market_id <=> a NEW order was refused (terminal for it); salt
+        nonzero with the ALL-ZERO market_id <=> a cancel_all was refused
+        (the one event where the all-zero key appears — the command named
+        no market); modify_seq nonzero <=> a modify was refused (the
+        order SURVIVES); order_id nonzero with the others zero <=> a
+        cancel was refused (unknown_order on a cancel retry means the
+        cancel already landed — treat as success). At least one of
+        salt / order_id is always nonzero.
+      properties:
+        version: { const: 7 }
+        type: { const: order_rejected }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            salt: { type: string, description: '"0" when the refused command carried no salt (cancel/modify).' }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            order_id: { type: string, description: '"0" when no order came to exist (edge reject before id assignment).' }
+            modify_seq: { type: integer, minimum: 0, description: Nonzero iff the refused command was a modify. }
+            reason:
+              type: string
+              description: >-
+                wrong_account also answers an order whose account field
+                does not embed the session token's account. off_tick
+                means the price is not a multiple of the market's
+                tick_step.
+              enum: [insufficient_funds, insufficient_position,
+                     reduce_only_not_modifiable, price_band, off_tick,
+                     sanctioned, session_capacity,
+                     unknown_market, market_not_open, unknown_order,
+                     duplicate_order_id, post_only_would_cross,
+                     stale_modify, capacity, wrong_account,
+                     expiry_too_soon, expiry_too_late, expiry_past_close,
+                     expired, validity_too_far, unfilled]
+
+    BadRequestFrame:
+      type: object
+      properties:
+        version: { const: 7 }
+        type: { const: bad_request }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            reason:
+              type: string
+              enum: [too_short, trailing, bad_version, bad_type,
+                     not_canonical, bad_number, bad_word, bad_hex,
+                     reserved_id, reserved_market, price_out_of_range,
+                     bad_disconnect_window,
+                     zero_qty, zero_modify_seq, bad_kind_price,
+                     bad_kind_expiry, bad_settle_price, oversize_frame,
+                     unauthenticated, rate_limited, not_operator]
+
+    ListenRejectedFrame:
+      type: object
+      description: >-
+        An operator listen was refused. subscription_capacity — the
+        venue-wide subscription table is full; room returns as other
+        subscriptions end. unknown_account — the named address embeds
+        no id the venue's ledger knows (also the answer for an account
+        the venue will not serve). The account echoes verbatim.
+      properties:
+        version: { const: 7 }
+        type: { const: listen_rejected }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            reason: { type: string, enum: [subscription_capacity, unknown_account] }
+
+    UnlistenDoneFrame:
+      type: object
+      description: >-
+        The unlisten applied (or the account was never listened — same
+        answer). Frames already queued behind the ack may still drain.
+      properties:
+        version: { const: 7 }
+        type: { const: unlisten_done }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+
+    # ---- WS event frames (OpenAPI has no WS channel type; these schemas
+    # document the one-message-per-text-frame vocabulary the /v1/ws stream
+    # emits after auth_ok). Terminal state is DERIVED, never carried:
+    # remaining->0 via fills, cancel_done, order_expired, or a terminal
+    # order_rejected. Every event redelivers on reconnect — dedup fills on
+    # (market_id, book_seq, fill_index) and apply `remaining` as an
+    # absolute, never a subtraction.
+
+    OrderAcceptedFrame:
+      type: object
+      description: >
+        The engine booked the order (maker or taker). ALWAYS precedes that
+        order's fills. qty echoes the ORIGINAL quantity — resting quantity
+        is derived from fills, never carried.
+      properties:
+        version: { const: 7 }
+        type: { const: order_accepted }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            salt: { type: string, description: '"0" for pre-restart orders recovered without their salt.' }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            book_seq: { $ref: "#/components/schemas/U64String" }
+            order_id: { $ref: "#/components/schemas/U64String" }
+            side: { $ref: "#/components/schemas/Side" }
+            price: { $ref: "#/components/schemas/Price" }
+            qty: { $ref: "#/components/schemas/U64String" }
+
+    FillFrame:
+      type: object
+      description: >
+        One fill, YES frame (maker-price execution). remaining is the
+        order's remaining quantity AFTER this fill (0 = filled out) —
+        absolute, so redelivery is idempotent. (market_id, book_seq,
+        fill_index) is the globally unique fill identity: one taker
+        command can produce N fills under one book_seq.
+      properties:
+        version: { const: 7 }
+        type: { const: fill }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            salt: { type: string }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            book_seq: { $ref: "#/components/schemas/U64String" }
+            fill_index: { type: integer, minimum: 0 }
+            order_id: { $ref: "#/components/schemas/U64String" }
+            side: { $ref: "#/components/schemas/Side" }
+            price: { $ref: "#/components/schemas/Price" }
+            qty: { $ref: "#/components/schemas/U64String" }
+            remaining: { type: string, pattern: "^[0-9]{1,20}$" }
+            liquidity: { type: string, enum: [maker, taker] }
+            fee: { type: string, pattern: "^[0-9]{1,20}$", description: Fee charged for this fill in micro-dollar base units, quoted decimal; "0" is legal. }
+            position_yes: { type: string, pattern: "^[0-9]{1,20}$", description: Your gross YES lots in this market AFTER this fill — absolute, never a delta; "0"/"0" is flat. }
+            position_no: { type: string, pattern: "^[0-9]{1,20}$", description: Your gross NO lots after this fill — same absolute contract. }
+
+    CancelDoneFrame:
+      type: object
+      description: >
+        TERMINAL. remaining = quantity released from the book, always
+        >= 1 (a cancel that raced its fill finds nothing resting and
+        draws order_rejected with reason unknown_order instead).
+        cause names the ending, so nothing is reverse-engineered from
+        client bookkeeping: requested (your cancel_order or cancel_all),
+        ioc_residual (an IOC/market order's unfilled remainder, including
+        a no-cross full quantity), gtd_expired (your expiry deadline
+        fired), self_trade (STP cancelled your resting order when your
+        own taker reached it), session_lost (the venue's
+        cancel-on-disconnect sweep fired — you did not ask; your own
+        cancel crossing the sweep in flight still answers requested,
+        because you did). Not here: an unfillable FOK never books —
+        it answers order_rejected with reason unfilled — and the
+        market-close sweep emits order_expired. gtd_expired and
+        session_lost are the gateway's judgment (a fired expiry and a
+        sweep entry are byte-identical to a cancel command inside the
+        venue); when your cancel races your own expiry, the word
+        follows whichever the gateway saw first — a cancel admitted
+        before the confirm reports requested, a fire landing first
+        reports gtd_expired. Either is then true; informational only.
+      properties:
+        version: { const: 7 }
+        type: { const: cancel_done }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            book_seq: { $ref: "#/components/schemas/U64String" }
+            order_id: { $ref: "#/components/schemas/U64String" }
+            remaining: { type: string, pattern: "^[0-9]{1,20}$" }
+            cause: { type: string, enum: [requested, ioc_residual, gtd_expired, self_trade, session_lost] }
+
+    ModifyDoneFrame:
+      type: object
+      description: >
+        NON-terminal: the order now rests at new_price with remaining qty
+        (always >= 1 — a filled-out order's modify rejects instead).
+      properties:
+        version: { const: 7 }
+        type: { const: modify_done }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            book_seq: { $ref: "#/components/schemas/U64String" }
+            order_id: { $ref: "#/components/schemas/U64String" }
+            modify_seq: { type: integer, minimum: 1 }
+            new_price: { $ref: "#/components/schemas/Price" }
+            remaining: { $ref: "#/components/schemas/U64String" }
+
+    OrderExpiredFrame:
+      type: object
+      description: >
+        TERMINAL. The market closed under the order (close sweep);
+        remaining always >= 1. Distinct from cancel_done so a client can
+        tell "the window ended" from "my cancel landed".
+      properties:
+        version: { const: 7 }
+        type: { const: order_expired }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            book_seq: { $ref: "#/components/schemas/U64String" }
+            order_id: { $ref: "#/components/schemas/U64String" }
+            remaining: { $ref: "#/components/schemas/U64String" }
+
+    FillSettledFrame:
+      type: object
+      description: >
+        A fill of yours reached on-chain finality. Joins the earlier fill
+        by (market_id, book_seq, fill_index). The collateral moved
+        pending_finality -> available is decomposed: proceeds (the
+        closing-leg sale value the netting realized), price_improvement
+        (opening-leg lock minus what the execution price consumed), and
+        fee_refund (worst-case fee reserve minus the fee charged). Each
+        component may be "0"; their sum is the amount promoted. Fills
+        settle in batches, roughly 0.2-0.5 s after the fill and OUT OF
+        ORDER across fills — never treat fill_settled as a watermark.
+      properties:
+        version: { const: 7 }
+        type: { const: fill_settled }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            order_id: { $ref: "#/components/schemas/U64String" }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            book_seq: { $ref: "#/components/schemas/U64String" }
+            fill_index: { type: integer, minimum: 0 }
+            proceeds: { type: string, pattern: "^[0-9]{1,20}$", description: Base units, quoted decimal. }
+            price_improvement: { type: string, pattern: "^[0-9]{1,20}$", description: Base units, quoted decimal. }
+            fee_refund: { type: string, pattern: "^[0-9]{1,20}$", description: Base units, quoted decimal. }
+
+    MarketSettledFrame:
+      type: object
+      description: >
+        TERMINAL for a market; sent only to affected accounts. Settlement
+        facts are venue-frame (yes_won means YES holders were paid), never
+        denormalized to your side's view.
+      properties:
+        version: { const: 7 }
+        type: { const: market_settled }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            outcome: { type: string, enum: [yes_won, no_won, void, at_price], description: void pays every lot the flat midpoint (500,000 base units). }
+            settle_price: { type: integer, minimum: 0, maximum: 999, description: 1..=999 only with at_price; exactly 0 otherwise. }
+            payout: { type: string, pattern: "^[0-9]{1,20}$", description: Your position payout in micro-dollar base units; "0" is legal. }
+            released: { type: string, pattern: "^[0-9]{1,20}$", description: Your fill releases still pending at finality, swept in the same application; "0" is legal. }
+
+    VenueStatusFrame:
+      type: object
+      description: >
+        The GET /v1/status body. mode "open" is the only word emitted
+        today; "cancel_only" and "paused" are reserved.
+      properties:
+        version: { const: 7 }
+        type: { const: venue_status }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            mode: { type: string, enum: [open, cancel_only, paused] }
+
+    MarketStateFrame:
+      type: object
+      description: >
+        One market's lifecycle card — an absolute restatement applied
+        by monotone state per market_id (created -> open -> closed ->
+        settled); duplicates are routine and legal. Delivered three
+        ways: in every connect snapshot (one per live market), staged
+        into your event stream when a market you hold a position in
+        closes or resolves (state settled means the resolution is
+        DETERMINED and funds are still pending — market_settled at
+        finality is the payout receipt), and re-delivered by a
+        venue-wide sweep on the session's liveness tick (~1 s), which
+        also carries created/open discovery. closes_at is the
+        advertised close in unix seconds ("0" = not announced),
+        advisory only — gate order entry on state, never the clock.
+      properties:
+        version: { const: 7 }
+        type: { const: market_state }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            state: { type: string, enum: [created, open, closed, settled] }
+            tick_step: { type: integer, minimum: 1, maximum: 500, description: The price-grid step in 0.1 cent ticks — a divisor of 1000 below it. }
+            fee_rate_bps: { type: integer, minimum: 0, maximum: 1000, description: "The market's taker-fee rate in basis points, set at creation and immutable. Takers pay rate × p × (1 − p) of the $1 payout per lot at the fill price, floored to the 10-micro-dollar grain with one grain as the minimum for any nonzero raw fee (only a zero rate charges nothing); makers never pay. The admission reserve prices the worst feasible fill and rounds UP to the grain, so the reserve always covers the charge." }
+            closes_at: { type: string, pattern: "^(0|[1-9][0-9]{0,19})$" }
+
+    # ---- Snapshot frames (GET /v1/orders NDJSON lines, the WS baseline
+    # after auth_ok, and an operator listen's per-account bracket).
+    # snapshot_begin is {"body":{}}; snapshot_end carries the account
+    # plus {orders, positions, markets, balances} counts — verify them
+    # against what you received. An operator session's connect bracket
+    # closes with the all-zero address (board only, no single account);
+    # a listen's bracket names the account with markets 0 (the board
+    # never repeats).
+
+    SnapshotOrderFrame:
+      type: object
+      description: >
+        One open order, YES frame. kind is always restable (gtc/post_only).
+        modify_seq is the last APPLIED sequence (0 = never modified) —
+        resume your own numbering strictly above it. A reduce_only order's
+        collateral is pledged position, not cash — do not read locked as
+        covering it.
+      properties:
+        version: { const: 7 }
+        type: { const: snapshot_order }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            salt: { type: string, description: '"0" for pre-restart orders recovered without their salt.' }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            order_id: { $ref: "#/components/schemas/U64String" }
+            side: { $ref: "#/components/schemas/Side" }
+            kind: { type: string, enum: [gtc, post_only] }
+            reduce_only: { type: boolean }
+            price: { $ref: "#/components/schemas/Price" }
+            remaining: { $ref: "#/components/schemas/U64String" }
+            modify_seq: { type: integer, minimum: 0 }
+
+    SnapshotPositionFrame:
+      type: object
+      description: >
+        One market's position: gross YES/NO lots (both sides coexist —
+        the venue nets exposure at settlement, never in the count) and
+        the slices pledged as closing legs of open orders (pledged <=
+        lots; unpledged lots are what a reduce_only order may consume,
+        so insufficient_position is predictable from this frame).
+        Emitted only for markets where the account holds any lots.
+      properties:
+        version: { const: 7 }
+        type: { const: snapshot_position }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            market_id: { $ref: "#/components/schemas/MarketKey" }
+            yes_lots: { type: string, pattern: "^[0-9]{1,20}$" }
+            no_lots: { type: string, pattern: "^[0-9]{1,20}$" }
+            yes_pledged: { type: string, pattern: "^[0-9]{1,20}$" }
+            no_pledged: { type: string, pattern: "^[0-9]{1,20}$" }
+
+    BalanceFrame:
+      type: object
+      description: >
+        Balances AFTER the preceding event applied — always the
+        absolute three buckets, never a delta, so redelivery and
+        reordering are harmless (the remaining-on-fills discipline,
+        applied to money). Emitted to the account's WS sessions after
+        every event that moves money (an admission lock, a
+        cancel/expiry release, a fill, fill_settled, market_settled)
+        and always after the causing frame. Apply by balance_seq
+        alone, highest wins: strictly increasing per account but NOT
+        dense — one cause may collapse several ledger mutations into
+        one frame under the final stamp, so a numeric jump means
+        nothing and no gap rule applies. snapshot_balance carries the
+        baseline stamp this stream continues from. A lost frame costs
+        staleness, never correctness — the next one carries the whole
+        truth.
+      properties:
+        version: { const: 7 }
+        type: { const: balance }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            balance_seq: { $ref: "#/components/schemas/U64String" }
+            available: { type: string, pattern: "^[0-9]{1,20}$" }
+            locked: { type: string, pattern: "^[0-9]{1,20}$" }
+            pending_finality: { type: string, pattern: "^[0-9]{1,20}$" }
+
+    SnapshotBalanceFrame:
+      type: object
+      description: >
+        Single-currency balances in base units. pending_finality is
+        collateral released by fills still awaiting on-chain settlement:
+        visible, never spendable, promoted to available on fill_settled
+        (or all at once at market settlement) — portfolio math must
+        include it. balance_seq is the account's balance-state version
+        at the snapshot — the baseline the live balance stream joins:
+        discard any balance frame carrying a stamp at or below it.
+      properties:
+        version: { const: 7 }
+        type: { const: snapshot_balance }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/Account" }
+            balance_seq: { $ref: "#/components/schemas/U64String" }
+            available: { type: string, pattern: "^[0-9]{1,20}$" }
+            locked: { type: string, pattern: "^[0-9]{1,20}$" }
+            pending_finality: { type: string, pattern: "^[0-9]{1,20}$" }
+
+    # order_rejected also rides the WS (schema above); bad_request answers
+    # a refused WS frame you sent. Market lifecycle rides the WS as
+    # market_state cards; the public edge feed remains the price/book
+    # surface.

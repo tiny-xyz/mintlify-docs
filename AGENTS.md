@@ -1,33 +1,27 @@
-> **First-time setup**: Customize this file for your project. Prompt the user to customize this file for their project.
-> For Mintlify product knowledge (components, configuration, writing standards),
-> install the Mintlify skill: `npx skills add https://mintlify.com/docs`
-
 # Documentation project instructions
 
-## About this project
+## Scope
 
-- This is a documentation site built on [Mintlify](https://mintlify.com)
-- Pages are MDX files with YAML frontmatter
-- Configuration lives in `docs.json`
-- Use the Mintlify MCP server, `https://mcp.mintlify.com`, to edit content and settings via MCP
-- Use the Mintlify docs MCP server, `https://www.mintlify.com/docs/mcp`, to query information about using Mintlify via MCP
+- This repository contains the Tiny Exchange internal Mintlify site.
+- Document the REST trading API, private and public WebSockets,
+  authentication, canonical wire formats, recovery, and fee accounting.
+- The exchange implementation lives in `tiny-xyz/tiny-exchange`; verify every
+  behavioral claim against that repository before changing it here.
+- Keep `api/external` aligned with the exchange repository's OpenAPI schemas.
 
-## Terminology
+## Style
 
-{/* Add product-specific terms and preferred usage */}
-{/* Example: Use "workspace" not "project", "member" not "user" */}
+- Use active voice and second person.
+- Keep sentences concise and state present behavior without historical notes.
+- Use sentence case for headings.
+- Format paths, commands, field names, and wire values as code.
+- State exact units and rounding rules for money and quantities.
+- Do not invent behavior that is absent from the implementation or schemas.
 
-## Style preferences
+## Structure and validation
 
-{/* Add any project-specific style rules below */}
-
-- Use active voice and second person ("you")
-- Keep sentences concise — one idea per sentence
-- Use sentence case for headings
-- Bold for UI elements: Click **Settings**
-- Code formatting for file names, commands, paths, and code references
-
-## Content boundaries
-
-{/* Define what should and shouldn't be documented */}
-{/* Example: Don't document internal admin features */}
+- Pages are root-level MDX files with YAML frontmatter.
+- Mintlify configuration lives in `docs.json`.
+- OpenAPI schemas live under `api/external`.
+- Run `npx --yes mintlify@latest validate` and
+  `npx --yes mintlify@latest broken-links` before publishing.

@@ -1,0 +1,103 @@
+---
+title: "Trading API overview"
+description: "Transport boundaries, data model, and command lifecycle for v7 clients."
+icon: "diagram-project"
+---
+
+The gateway uses REST for commands and snapshots plus WebSocket for the live
+private event stream. Separate edge servers expose the public market-data
+WebSocket. Both surfaces use strict canonical integer JSON with different
+envelopes and message vocabularies, so ordinary JSON equivalence is not enough.
+
+## Surface
+
+| Purpose | Transport | Route | Success meaning |
+| --- | --- | --- | --- |
+| Submit an order | REST | `POST /v1/orders` | Validated, collateral locked, and durably published |
+| Rebuild account state | REST | `GET /v1/orders` | Ordered NDJSON snapshot completed |
+| Modify price | REST | `POST /v1/modify` | Command durably forwarded |
+| Cancel one order | REST | `POST /v1/cancel` | Command durably forwarded |
+| Cancel all open orders | REST | `POST /v1/cancel-all` | All generated cancels durably forwarded |
+| Receive private events | WebSocket | `GET /v1/ws` | Upgrade only; authenticate in the first text frame |
+| Receive public books and trades | WebSocket | `GET /v1/stream` | Upgrade only; send an exact subscription message |
+| Check front health | REST | `GET /v1/status` | An answering front has a live command path |
+
+`202 Accepted` never means the order booked or filled. The definitive result is
+an event such as `order_accepted`, `fill`, `modify_done`, `cancel_done`, or
+`order_rejected`.
+
+## Frame envelopes
+
+Client frames contain `version`, `type`, then `body`:
+
+```json
+{"version":7,"type":"cancel_order","body":{"account":"000000000000000000000000000000000000002a","market_id":"0000000000000000000000000000000000000000000000000000000000000005","order_id":"281474976710663"}}
+```
+
+Server frames insert `ts_ms` between `type` and `body`:
+
+```json
+{"version":7,"type":"venue_status","ts_ms":"1730000000000","body":{"mode":"open"}}
+```
+
+Frames are at most 552 bytes. Keys have a fixed order; whitespace, floats,
+unknown keys, duplicate keys, reordered keys, and non-canonical numeric forms
+are refused.
+
+## Units and identifiers
+
+| Value | Representation |
+| --- | --- |
+| Price | Integer ticks `1..=999`; one tick is 0.1 cent |
+| Payout | `1,000` ticks = `1,000,000` micro-dollar base units per winning lot |
+| Money | Integer micro-dollars; one unit is `$0.000001` |
+| Quantity | Integer lots, quoted as a canonical decimal string on the wire |
+| Account | 20-byte chain address as 40 lowercase hex characters, no `0x` |
+| Market | 32-byte key as 64 lowercase hex characters |
+| Order ID | Nonzero `u64`, quoted as a canonical decimal string |
+
+The wire always names the YES contract. Normalize NO exposure before encoding:
+buy NO at `p` becomes sell YES at `1000 - p`.
+
+## Order lifecycle
+
+<Steps>
+  <Step title="Build and retain the canonical frame">
+    Choose a distinct nonzero `salt`, set `valid_until` to cover the retry
+    budget, and preserve the exact encoded bytes.
+  </Step>
+  <Step title="Submit">
+    On `202`, retain the returned exchange `order_id`. Funds covering cost and
+    worst-case fee are already locked for the cash-backed opening remainder.
+  </Step>
+  <Step title="Observe the engine verdict">
+    Wait for `order_accepted`, `order_rejected`, and any fills on the WebSocket
+    stream. An accepted order may fill immediately before any resting state is
+    useful to the client.
+  </Step>
+  <Step title="Track terminal state">
+    An order ends when fills drive `remaining` to zero, or on `cancel_done`,
+    `order_expired`, or a terminal `order_rejected`.
+  </Step>
+</Steps>
+
+## Ambiguous outcomes
+
+- `503` means ingress is saturated and the command was not admitted. Retry
+  according to the endpoint contract.
+- `504` means the risk thread exceeded its response budget and the command may
+  have executed. For a new order, resend the exact same bytes while
+  `valid_until` remains open or reconcile from a snapshot. Never construct a
+  replacement blindly.
+- Cancel commands are goal-idempotent. Repeating a cancel is safe; a later
+  `unknown_order` means the order is already gone.
+- A repeated modify with the same `modify_seq` can return `stale_modify`; that
+  means the original sequence already applied. Resume above the snapshot's
+  last applied sequence.
+
+## Specification boundary
+
+The API reference tab is generated from the trading and edge OpenAPI documents
+under `api/external`. Use it for field shapes and endpoint responses. Use the
+canonical codec for trading-frame byte construction and the WebSocket guides
+for stream-specific state application.

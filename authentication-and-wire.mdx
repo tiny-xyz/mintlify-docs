@@ -1,0 +1,101 @@
+---
+title: "Authentication and canonical wire"
+description: "Create Tiny-v1 credentials and encode strict v7 frames."
+icon: "key"
+---
+
+Authenticated REST requests send a `Tiny-v1` authorization value. WebSocket
+connections send the decoded auth frame as their first text message after the
+upgrade.
+
+## Authorization header
+
+The header has this shape:
+
+```text
+Authorization: Tiny-v1 <hex-encoded-canonical-auth-frame>
+```
+
+The decoded bytes are exactly:
+
+```json
+{"version":7,"type":"auth","body":{"account":"42","expires_at":"1730000000000000000","key_id":1,"cancel_on_disconnect_ms":0,"sig":"<128-lowercase-hex>"}}
+```
+
+The signature is HMAC-SHA512 over:
+
+```text
+tiny-auth-v1:<account>:<expires_at>:<key_id>
+```
+
+Use the secret selected by `key_id`. The key store that resolves the ID fixes
+the session scope: client tokens are bound to one account, while venue operator
+tokens can subscribe to and trade for multiple ledger-known accounts.
+
+<Note>
+`cancel_on_disconnect_ms` is intentionally outside the HMAC message. It is
+session policy: `0` disables the sweep; otherwise the accepted range is
+`3000..=600000` milliseconds.
+</Note>
+
+## REST authority
+
+For ordinary client requests, the address in the command body must embed the
+same account as the token. A mismatch rejects as `wrong_account`. REST remains
+per-request client-token authority even when operator WebSocket support is
+enabled.
+
+The 65-byte `sig` inside new and modified orders is a future settlement
+signature slot. It is carried and journaled but not verified by the current
+gateway. Send exactly 130 lowercase hex characters; zeroes are legal during
+this phase.
+
+## WebSocket authentication
+
+<Steps>
+  <Step title="Open a fresh connection">
+    Upgrade `GET /v1/ws` on a TCP connection that has not served an
+    authenticated REST request.
+  </Step>
+  <Step title="Send auth first">
+    The first text frame must be the canonical auth JSON, not the hex-encoded
+    header form.
+  </Step>
+  <Step title="Wait for the baseline">
+    After `auth_ok`, consume the complete snapshot bracket before treating live
+    events as current state.
+  </Step>
+</Steps>
+
+Re-authentication is refused. Reconnect to rotate credentials. Token expiry
+closes with code `1008`; event backpressure closes with `1013`.
+
+## Canonical JSON checklist
+
+- Encode the documented key order exactly.
+- Emit no spaces, newlines, or insignificant formatting.
+- Use lowercase hex with no prefixes.
+- Encode `u64` values as quoted canonical decimals where the schema requires
+  strings: no sign and no leading zeroes.
+- Emit JSON booleans as bare `true` or `false`.
+- Never emit floating-point values.
+- Keep each frame at or below 552 bytes.
+- Do not add fields for forward compatibility; unknown fields reject.
+
+<Warning>
+Do not parse a frame into a generic map and serialize it again for retry. Map
+ordering or numeric normalization can change the bytes and turn the request
+into a fresh order. Retain and replay the original byte buffer.
+</Warning>
+
+## Operator subscriptions
+
+Operator sessions start with a venue-board snapshot and no account event
+subscriptions. Send `listen` for each account before trading it. The account's
+own `snapshot_end` closes its baseline and confirms the subscription. Trading
+before listening can return the direct `order_submitted` response while hiding
+the later account-routed engine verdict from that session.
+
+`unlisten` is goal-idempotent and returns `unlisten_done` even if the account
+was not subscribed. Subscription state is in-memory session state and never
+survives reconnects.
