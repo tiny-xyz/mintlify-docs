@@ -4,6 +4,8 @@ This repository is the standalone Mintlify source for Tiny Exchange's internal
 integration documentation. It contains only documentation pages, Mintlify
 configuration, and the OpenAPI schemas used to generate the API reference.
 
+Hosted site: [tiny-markets.mintlify.app](https://tiny-markets.mintlify.app)
+
 The exchange implementation and canonical protocol behavior live in the
 private `tiny-xyz/tiny-exchange` repository. Update these docs alongside any
 implementation change that affects authentication, wire formats, endpoints,
