@@ -25,6 +25,7 @@
             "pages": [
               "websocket-trading",
               "multi-strategy",
+              "operator-provisioning",
               "websocket-market-data",
               "events-and-recovery",
               "fees"

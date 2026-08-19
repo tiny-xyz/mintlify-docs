@@ -191,7 +191,7 @@ WebSocket implementation without an HTTP status.
 | Code | Meaning and recovery |
 | ---: | --- |
 | `1000` | Normal close or idle unsubscribed socket; reconnect if still needed |
-| `1001` | Liveness probe unanswered or a pinned market was evicted; reconnect |
+| `1001` | Liveness probe unanswered; the peer is presumed gone — reconnect |
 | `1002` | WebSocket protocol violation |
 | `1008` | Invalid application message or explicit pin limit exceeded |
 | `1009` | Assembled data message exceeded 64 bytes |

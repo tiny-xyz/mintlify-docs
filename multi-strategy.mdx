@@ -40,24 +40,15 @@ trading.
 {"version":8,"type":"listen","body":{"accounts":["...01","...02","...03"]}}
 ```
 
-Verdicts are **per account**, judged in frame order exactly as if the
-frame had arrived once per account: an unknown account mid-batch gets
-its own `listen_rejected` and voids nothing around it. An empty
-batch, an 11-account batch, or a duplicate rejects the frame shape
-itself (`bad_account_batch`). `unlisten` mirrors the batching.
-
-An admitted listen answers with the account's own baseline bracket —
-`snapshot_begin`, the account's orders/positions/balance rows,
-`snapshot_end` — and that closing `snapshot_end` **is** the
-subscribed confirmation: from then on every event for the account
-routes to the session, tagged with its address. Reconcile from the
-bracket, then trust the stream.
-
-The 10-account cap is the frame budget, not venue policy — a runner
-with more accounts pipelines more frames. Listens bill the
-*operator's* rate allowance (not the watched accounts'), so a
-reconnecting runner re-listens hundreds of accounts within a couple
-of rate windows.
+Verdicts are **per account**, in frame order: one refused account
+voids nothing around it, and each admitted account's baseline
+bracket — closed by its `snapshot_end` — **is** the subscribed
+confirmation. Reconcile from the bracket, then trust the stream.
+The cap is the frame budget, not venue policy: pipeline more frames
+for more accounts. Listens bill the *operator's* rate allowance, so
+a reconnecting runner re-listens hundreds of accounts within a
+couple of rate windows. The full frame contract is in
+[the private trading WebSocket](/websocket-trading#automatic-snapshot).
 
 ## One heartbeat for all of them
 

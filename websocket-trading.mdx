@@ -186,9 +186,12 @@ alone.
 
 ## Operator multiplexing
 
-Operator tokens are resolved by the venue's separate operator key store. The
-operator socket starts with no account subscriptions and can send `listen` or
-`unlisten` frames containing one canonical 40-hex address.
+Operator tokens resolve in the venue's separate operator key store, which is
+deployed only on the gateway core — dial the core's listen address, never a
+shell front (see [Operator provisioning](/operator-provisioning) for keys and
+addresses). The socket starts with the venue-board baseline and no account
+subscriptions; the batch `listen`/`unlisten` contract is described under
+[Automatic snapshot](#automatic-snapshot).
 
 <Warning>
 Listen before trading for an account. The direct `order_submitted` acknowledgement

@@ -95,11 +95,9 @@ into a fresh order. Retain and replay the original byte buffer.
 ## Operator subscriptions
 
 Operator sessions start with a venue-board snapshot and no account event
-subscriptions. Send `listen` for each account before trading it. The account's
-own `snapshot_end` closes its baseline and confirms the subscription. Trading
-before listening can return the direct `order_submitted` response while hiding
-the later account-routed engine verdict from that session.
-
-`unlisten` is goal-idempotent and returns `unlisten_done` even if the account
-was not subscribed. Subscription state is in-memory session state and never
-survives reconnects.
+subscriptions: `listen` each account before trading it, and re-listen after
+every reconnect. The full contract — batching, per-account verdicts,
+baselines, and the dead-runner sweep — lives in
+[the private trading WebSocket](/websocket-trading#operator-multiplexing) and
+[the multi-strategy runner model](/multi-strategy); key minting lives in
+[Operator provisioning](/operator-provisioning).

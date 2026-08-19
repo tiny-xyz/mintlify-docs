@@ -127,7 +127,9 @@ paths:
               schema:
                 description: One canonical frame per line, in order.
                 type: string
+        "400": { description: bad_request — a GET with a body is refused. }
         "401": { $ref: "#/components/responses/AuthFailed" }
+        "429": { $ref: "#/components/responses/RateLimited" }
 
   /v1/cancel:
     post:
@@ -377,7 +379,12 @@ components:
     Kind:
       type: string
       enum: [gtc, post_only, ioc, fok, market]
-      description: kind "market" requires price exactly 0 (mapped to an extreme-priced IOC); all others require price 1..=999.
+      description: >-
+        kind "market" requires price exactly 0, mapped to an IOC at the
+        market's on-step extreme (1000 minus tick_step buying, tick_step
+        selling; for a protection price send ioc at that price); all
+        other kinds require price 1..=999 on the market's tick_step
+        grid.
     Account:
       type: string
       pattern: "^[0-9a-f]{40}$"
@@ -448,7 +455,10 @@ components:
               type: integer
               minimum: 0
               maximum: 999
-              description: 1..=999, except exactly 0 when kind is market.
+              description: >-
+                1..=999 and a multiple of the market's tick_step (the
+                market_state card carries it; off-step rejects
+                off_tick), except exactly 0 when kind is market.
             qty: { $ref: "#/components/schemas/U64String" }
             expiry:
               type: string
@@ -631,6 +641,13 @@ components:
 
     BadRequestFrame:
       type: object
+      description: >-
+        The full closed word set of the codec. bad_settle_price,
+        bad_reject_identity, bad_snapshot_kind, and oversize_frame are
+        server-shape or currently unreachable words — retained by the
+        codec, not emitted for a current client request (an oversized
+        REST body draws a status-only 413, an oversized WS payload
+        closes 1002).
       properties:
         version: { const: 8 }
         type: { const: bad_request }
@@ -646,6 +663,7 @@ components:
                      bad_disconnect_window,
                      zero_qty, zero_modify_seq, bad_kind_price,
                      bad_kind_expiry, bad_settle_price,
+                     bad_reject_identity, bad_snapshot_kind,
                      bad_account_batch, oversize_frame,
                      unauthenticated, rate_limited, not_operator]
 
@@ -907,6 +925,43 @@ components:
             fee_rate_bps: { type: integer, minimum: 0, maximum: 1000, description: "The market's taker-fee rate in basis points, set at creation and immutable. Takers pay rate × p × (1 − p) of the $1 payout per lot at the fill price, floored to the 10-micro-dollar grain with one grain as the minimum for any nonzero raw fee (only a zero rate charges nothing); makers never pay. The admission reserve prices the worst feasible fill and rounds UP to the grain, so the reserve always covers the charge." }
             closes_at: { type: string, pattern: "^(0|[1-9][0-9]{0,19})$" }
 
+    # ---- Session frames (the WS auth handshake's two answers).
+
+    AuthOkFrame:
+      type: object
+      description: >-
+        The accepted WS auth's answer; the snapshot baseline follows.
+        account is the token's u64 account id as a quoted decimal —
+        the one frame that speaks the id rather than the 40-hex
+        address (the token names the id; the address embedding is the
+        client's own construction).
+      properties:
+        version: { const: 8 }
+        type: { const: auth_ok }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account: { $ref: "#/components/schemas/U64String" }
+
+    AuthFailedFrame:
+      type: object
+      description: >-
+        Authentication refused (401 body on REST; on WS the socket
+        closes after it). Deliberately echoes no account: an
+        unauthenticated caller is owed nothing it did not already
+        know, least of all confirmation that an account exists.
+        sanctioned is issued only at WS open — on REST a sanctioned
+        account passes auth and is refused at admission instead.
+      properties:
+        version: { const: 8 }
+        type: { const: auth_failed }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            reason: { type: string, enum: [bad_token, expired_token, unknown_key, sanctioned] }
+
     # ---- Snapshot frames (GET /v1/orders NDJSON lines, the WS baseline
     # after auth_ok, and an operator listen's per-account bracket).
     # snapshot_begin is {"body":{}}; snapshot_end carries the account
@@ -915,6 +970,45 @@ components:
     # closes with the all-zero address (board only, no single account);
     # a listen's bracket names the account with markets 0 (the board
     # never repeats).
+
+    SnapshotBeginFrame:
+      type: object
+      description: Opens every snapshot bracket; the body is empty.
+      properties:
+        version: { const: 8 }
+        type: { const: snapshot_begin }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          additionalProperties: false
+
+    SnapshotEndFrame:
+      type: object
+      description: >-
+        Closes the bracket with integrity counts — verify each against
+        the lines received. account names the snapshotted account, or
+        is the all-zero address on a board-only bracket (an operator
+        session's connect baseline — the one place the zero address is
+        legal on the wire). markets counts the market_state cards
+        served (every live market on a connect bracket, 0 on a
+        listen's bracket — the board never repeats); balances is
+        always 1 on an account bracket (single-currency ledger), kept
+        as a count so the check reads four uniform fields.
+      properties:
+        version: { const: 8 }
+        type: { const: snapshot_end }
+        ts_ms: { $ref: "#/components/schemas/TsMs" }
+        body:
+          type: object
+          properties:
+            account:
+              type: string
+              pattern: "^[0-9a-f]{40}$"
+              description: The snapshotted account, or all-zero as the venue-scope sentinel.
+            orders: { type: integer, minimum: 0 }
+            positions: { type: integer, minimum: 0 }
+            markets: { type: integer, minimum: 0 }
+            balances: { type: integer, minimum: 0 }
 
     SnapshotOrderFrame:
       type: object

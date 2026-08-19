@@ -1,0 +1,98 @@
+---
+title: "Operator provisioning"
+description: "Mint operator keys, connect to the core, and add trading accounts."
+icon: "id-card"
+---
+
+Operator scope is venue infrastructure. This page covers what the venue and a
+contracted runner do off the wire: key custody, where operator sessions
+connect, and how a new trading account comes to exist. The wire itself is the
+ordinary v8 surface plus the subscription vocabulary — see
+[the private trading WebSocket](/websocket-trading) and
+[the multi-strategy runner model](/multi-strategy).
+
+## Two key stores, one scope rule
+
+The gateway loads two id-disjoint `tiny-keys-v1` files at boot: `--keys` for
+client sessions (also deployed to shell fronts) and `--operator-keys` for
+operator sessions (gateway core only). Boot refuses an ID overlap, so which
+store resolves a token's `key_id` decides the session scope for its whole
+life. Nothing inside the token chooses.
+
+Key files are `<key_id> <128hex>` lines with `#` comments, `0600`
+permissions required, loaded once at boot. Adding, removing, or rotating a
+key is a gateway restart, and removal is the only revocation — tokens verify
+locally with no callback.
+
+## Minting
+
+<Steps>
+  <Step title="Generate a key">
+    `tiny-gateway-keytool gen <key_id>` emits one key-file line from OS
+    entropy. Append it to the operator store on the gateway box and restart
+    the gateway.
+  </Step>
+  <Step title="Mint the token">
+    `tiny-gateway-keytool mint --keys <operator-store> --key-id <n>
+    --account <n> --expires-at <wall-ns>` emits the canonical `auth` frame
+    and its hex header form. The minted account is the operator's own auth
+    identity: it pays the operator's `listen`/`unlisten` rate charge and
+    needs no funding — trading authority comes from each frame's body
+    account.
+  </Step>
+  <Step title="Deliver out of band">
+    Hand the runner the token, or the key line if the runner mints its own
+    rotations. `expires_at` bounds the token's life; at expiry the session
+    closes `1008` and the runner reconnects with a fresh token, so
+    short-lived tokens rotate with no venue action.
+  </Step>
+</Steps>
+
+Minted frames carry `cancel_on_disconnect_ms` `0`. The field sits outside the
+signature domain, so the runner re-encodes the signed fields with its own
+window without re-minting.
+
+## Connect to the core, not a shell
+
+The operator store is never deployed to shell fronts, so an operator token
+presented to a shell fails with `auth_failed` `unknown_key`. Dial the gateway
+core's own listen address on the private network; `ops/deploy/colo.toml` in
+the exchange repository is the address authority. REST with an operator token
+serves single-account semantics only — cross-account authority and
+subscriptions are WebSocket session state.
+
+## Adding a new trading account
+
+Accounts exist by ledger funding, and funding is a boot snapshot: the gateway
+boots balances from the `--funding` file (`tiny-funding-v2`, one
+`<account> <micro-dollars>` line each) played through the mock chain. There
+is no runtime deposit path, and a changed funding file requires an explicit
+migration, never an ordinary restart.
+
+- **Venue:** add the funding line, run the migration, confirm the account ID
+  to the runner. No new keys — operator scope already reaches every
+  ledger-known account.
+- **Runner:** `listen` the account's canonical address (the `u64` ID
+  big-endian in the last 8 bytes, zeros elsewhere). The admitted baseline
+  bracket restates its starting balances; trade from then on.
+
+A per-account client token — for a direct client session beside the
+operator's — is a separate mint against the client store and is never
+required for operator trading.
+
+## Deployed capacities
+
+Defaults; the gateway flags and `ops/deploy/colo.toml` are the per-deploy
+authority.
+
+| Capacity | Default | Flag |
+| --- | ---: | --- |
+| Operator session slots (structural max 64) | 4 | `--operator-sessions` |
+| Egress frames per operator slot | 32,768 | `--operator-egress-slots` |
+| Listened-account subscription rows, venue-wide | 4,096 | `--subscription-slots` |
+| Accounts per `listen`/`unlisten` frame | 10 | frame budget, not policy |
+| Requests per second per account | 30 | `--account-msgs-per-sec` |
+
+Egress overflow closes `1013`: back off, reconnect, re-listen, and
+reconcile from the fresh brackets. The subscription table sits outside the
+replay fingerprint, so resizing it is an ordinary restart.
