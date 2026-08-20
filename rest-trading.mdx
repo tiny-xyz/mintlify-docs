@@ -4,10 +4,10 @@ description: "Commands, acknowledgements, snapshots, and per-account order prote
 icon: "bolt"
 ---
 
-All trading is REST. Each command is one HTTP `POST` whose body is a single
-canonical frame, authenticated by the `Tiny-v1` header on that request. There
-is no trading WebSocket and no trading session: identity, scope, and policy
-ride each request.
+All trading is REST. Each command is one HTTP request — `POST`, or `DELETE`
+for the cancel doors — whose body is a single canonical frame, authenticated
+by the `Tiny-v1` header on that request. There is no trading WebSocket and no
+trading session: identity, scope, and policy ride each request.
 
 ## Command doors
 
@@ -17,10 +17,15 @@ Each route accepts exactly one frame type; any other type answers
 | Route | Frame type | Acknowledgement |
 | --- | --- | --- |
 | `POST /v1/orders` | `new_order` | `202` with an `order_submitted` body carrying the exchange `order_id` |
-| `POST /v1/cancel` | `cancel_order` | Bodyless `202` after durable publication |
-| `POST /v1/cancel-all` | `cancel_all` | Bodyless `202` after every expanded cancel durably published |
+| `DELETE /v1/cancel` | `cancel_order` | Bodyless `202` after durable publication |
+| `DELETE /v1/cancel-all` | `cancel_all` | Bodyless `202` after every expanded cancel durably published |
 | `POST /v1/modify` | `modify_order` | Bodyless `202` after durable publication |
 | `POST /v1/heartbeat` | `heartbeat` | Bodyless `202`: the whole batch armed, re-anchored, or disarmed |
+
+The cancel doors are `DELETE` with a request body: the method says what the
+request does, and the body stays the same canonical frame every command
+shares (it carries fields no path could: account, market, salt). Send the
+`Content-Length` exactly as on a `POST`.
 
 Every `202` means durably accepted, never executed: engine verdicts
 (`order_accepted`, fills, `cancel_done`, `modify_done`, asynchronous
@@ -42,7 +47,8 @@ modifies with the same `modify_seq`.
   arrives — a token can expire between requests on one keep-alive connection.
 - Rate limits charge the token's account (30 requests per second per account
   by default) plus a per-connection limiter.
-- `GET` on a command route answers `405`.
+- The wrong method on an existing route answers `405` — including `POST` on
+  the cancel doors and `DELETE` on the `POST` doors.
 
 ## Snapshots
 

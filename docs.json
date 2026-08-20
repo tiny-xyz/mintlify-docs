@@ -54,11 +54,11 @@
             "group": "Orders",
             "pages": [
               "POST /v1/orders",
-              "POST /v1/cancel",
+              "DELETE /v1/cancel",
               "GET /v1/orders",
               "GET /v1/orders/{account}",
               "POST /v1/modify",
-              "POST /v1/cancel-all",
+              "DELETE /v1/cancel-all",
               "POST /v1/heartbeat"
             ]
           },

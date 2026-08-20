@@ -17,11 +17,11 @@ equivalence is not enough.
 | Purpose | Transport | Route | Success meaning |
 | --- | --- | --- | --- |
 | Submit an order | REST | `POST /v1/orders` | Validated, collateral locked, and durably published |
-| Cancel one order | REST | `POST /v1/cancel` | Command durably forwarded |
+| Cancel one order | REST | `DELETE /v1/cancel` | Command durably forwarded |
 | Rebuild account state | REST | `GET /v1/orders` | Anchored NDJSON snapshot completed |
 | Rebuild another account's state (operator) | REST | `GET /v1/orders/{account}` | Anchored NDJSON snapshot completed |
 | Modify price | REST | `POST /v1/modify` | Command durably forwarded |
-| Cancel all open orders | REST | `POST /v1/cancel-all` | All generated cancels durably forwarded |
+| Cancel all open orders | REST | `DELETE /v1/cancel-all` | All generated cancels durably forwarded |
 | Arm, re-anchor, or disarm order protection | REST | `POST /v1/heartbeat` | The whole batch armed, re-anchored, or disarmed |
 | Receive private events | WebSocket | `GET /v1/ws` (account-edge host) | Upgrade only; authenticate in the first text frame |
 | Receive public books and trades | WebSocket | `GET /v1/stream` (edge host) | Upgrade only; send an exact subscription message |

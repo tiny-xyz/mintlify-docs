@@ -178,7 +178,7 @@ paths:
         "429": { $ref: "#/components/responses/RateLimited" }
 
   /v1/cancel:
-    post:
+    delete:
       summary: Cancel single order
       description: >
         Cancel by exchange order id. Blind-forwarded — skips risk
@@ -208,7 +208,7 @@ paths:
         "504": { description: Unknown outcome — repeat the cancel or reconcile via snapshot. }
 
   /v1/cancel-all:
-    post:
+    delete:
       summary: Cancel all orders
       description: >
         Every open order of the account, all markets, in one request.
