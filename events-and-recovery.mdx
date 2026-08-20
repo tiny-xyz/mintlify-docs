@@ -1,34 +1,44 @@
 ---
 title: "Events and recovery"
-description: "Apply snapshots and WebSocket events without double-counting or ordering bugs."
+description: "Apply snapshots and live account events without double-counting or ordering bugs."
 icon: "rotate"
 ---
 
-There is no event replay buffer. A reconnect rebuilds an absolute account
-baseline, then resumes live delivery.
+The live stream is best-effort with a dense per-account `event_seq`; the REST
+snapshot carries the anchor that stream splices against; the history plane
+replays stored frames after any cursor. Recovery is always
+snapshot-then-splice — never inference from a possibly-holed stream.
 
 ## Reconnect procedure
 
 <Steps>
   <Step title="Discard connection-local assumptions">
-    Treat operator subscriptions and any incomplete snapshot bracket as gone.
-    Keep durable client facts such as exchange `order_id` and the original
-    bytes of still-retryable orders.
+    Treat operator subscriptions as gone. Keep durable client facts such as
+    exchange `order_id` and the original bytes of still-retryable orders.
   </Step>
-  <Step title="Fetch or receive a fresh snapshot">
-    `GET /v1/orders` returns NDJSON. A WebSocket authentication also stages the
-    same baseline. Read from `snapshot_begin` through `snapshot_end` and verify
-    the advertised counts.
+  <Step title="Reconnect the stream and buffer">
+    Reopen the account-events WebSocket (re-`listen` under operator scope)
+    and buffer incoming frames without applying them.
+  </Step>
+  <Step title="Fetch a fresh snapshot">
+    `GET /v1/orders` returns NDJSON. Read from `snapshot_begin` through
+    `snapshot_end` and verify the advertised counts.
   </Step>
   <Step title="Replace absolute state">
     Rebuild open orders, positions, market cards, and the three balance
     buckets. Do not merge a partial bracket into the previous baseline.
   </Step>
-  <Step title="Resume live events">
-    Apply order events by identity, fills by their global fill identity, and
-    balances only when their sequence is newer than the snapshot baseline.
+  <Step title="Splice the stream above the anchor">
+    Drop buffered frames whose `event_seq` is at or below the snapshot's
+    anchor — they are already reflected in the rows — and apply the rest in
+    sequence order.
   </Step>
 </Steps>
+
+If the buffered stream itself shows an `event_seq` gap, re-snapshot: a hole is
+a fact about delivery, never something to interpolate. For history that
+predates the live stream's buffer, page `GET /v1/history/account-events`
+with `after=<cursor>` — rows are the verbatim frames the gateway published.
 
 ## Idempotency keys
 
@@ -43,6 +53,8 @@ baseline, then resumes live delivery.
 
 `ts_ms` is wall-clock observability and never orders events. `fill_settled`
 events may arrive out of order across fills and are not watermarks.
+`event_seq` orders delivery per account; `book_seq` orders facts per market —
+do not exchange their roles.
 
 ## Snapshot contents
 
@@ -53,7 +65,8 @@ An account snapshot contains:
 - one `snapshot_position` per market with a nonzero position;
 - one `snapshot_balance` with `available`, `locked`, `pending_finality`, and
   its `balance_seq` baseline;
-- a final `snapshot_end` whose counts must match the frames received.
+- a final `snapshot_end` whose counts must match the frames received, and
+  whose `event_seq` is the stream splice anchor.
 
 The three money buckets are all portfolio value, but only `available` can fund
 new orders. `pending_finality` is visible collateral released by fills that is
@@ -64,7 +77,8 @@ not spendable until chain finality.
 An order is terminal when any of these occurs:
 
 - a `fill` sets `remaining` to `"0"`;
-- `cancel_done` reports a released remainder;
+- `cancel_done` reports a released remainder — including cause
+  `session_lost`, the heartbeat deadman's sweep;
 - `order_expired` reports the market-close sweep;
 - `order_rejected` identifies a failed new order or another terminal engine
   refusal.

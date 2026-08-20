@@ -1,11 +1,14 @@
 # Tiny public WS stream — tiny-edge /v1/stream (OpenAPI 3.1).
 #
-# The colo read-side surface actually LIVE today: tiny-edge's WebSocket
-# stream (snapshot on subscribe, then gapless per-connection deltas),
-# served from cloned edge boxes behind Cloudflare. Authoritative prose
-# contract: docs/context/api.md; the byte-pinned tests in
-# services/edge/tests/render.rs are the freeze — this file mirrors them
-# for tooling and must move in the same commit as any render change.
+# The read side's public delivery surface: tiny-edge's relay WebSocket
+# stream (sub_ok splice anchor on subscribe, then every feed update as
+# one gapless per-connection delta), served from cloned edge boxes.
+# The edge holds no book: state recovery is the history REST plane
+# (openapi-history-rest-v1.yaml), spliced on (epoch, update_seq).
+# Authoritative prose contract: docs/context/api.md; the byte-pinned
+# tests in services/edge/tests/render.rs are the freeze — this file
+# mirrors them for tooling and must move in the same commit as any
+# render change.
 #
 # Distinct from openapi-trading-v8-draft.yaml (order entry at the
 # gateway). Conventions shared: strict JSON, integers
@@ -23,18 +26,23 @@
 openapi: 3.1.0
 info:
   title: Tiny edge WebSocket stream
-  version: "1.4"
+  version: "2.0"
   description: >
-    Public, unauthenticated market-data stream. Subscribe with
+    Public, unauthenticated market-data relay. Subscribe with
     {"type":"sub"} to follow the venue's default market, and/or pin up
     to 8 markets by id with {"type":"sub","market_id":"N"}; each sub
-    answers a full snapshot of that market, then its sequenced deltas.
-    Every server frame carries ONE gapless per-connection seq across
-    all subscriptions (quoted u64, from "1") — a gap means loss, and
-    the recovery verb is simply re-sub. A stale frame is stream-scoped
-    (every rendered market is flagged not-live) and each market clears
-    on its own next snapshot. No account or order identity exists in
-    this vocabulary (anonymity by field absence).
+    answers a sub_ok splice anchor (market identity, lifecycle card,
+    stream coordinate), then that market's sequenced deltas. The edge
+    holds no book — clients needing state fetch the history REST
+    plane's keyframe + delta rows and splice live deltas above the
+    anchor on (epoch, update_seq). Every server frame carries ONE
+    gapless per-connection seq across all subscriptions (quoted u64,
+    from "1") — a gap means loss, and the recovery verb is re-sub +
+    re-anchor. stale/live frames flag and clear the whole stream's
+    not-live condition. No account or order identity exists in this
+    vocabulary (anonymity by field absence). Schema 2.0: snapshot
+    frames, the edge REST /v1/book plane, and the tick_step_change
+    delta kind of the 1.x lineage do not exist.
 
 servers:
   - url: https://ws.tiny-testing.xyz
@@ -79,8 +87,8 @@ paths:
             Switching Protocols. Thereafter the socket speaks the frame
             vocabulary in components.schemas: client sends client_sub /
             client_sub_market / client_unsub / client_unsub_market;
-            server sends server_snapshot / server_delta / server_stale,
-            each stamped with the connection's gapless seq.
+            server sends server_sub_ok / server_delta / server_stale /
+            server_live, each stamped with the connection's gapless seq.
         "400":
           description: Malformed head, non-upgrade GET, or a framing/smuggling shape (any body, chunked transfer, Expect, data before the 101).
         "404":
@@ -91,8 +99,8 @@ paths:
           description: >
             Retryable — connection slots full, per-IP cap,
             upgrade-population cap, or the readiness gate (no complete
-            keyframe has proven this box's mirror yet; typically only
-            the first ~2 s after an edge boots).
+            keyframe sweep of the current feed incarnation seen yet;
+            typically only the first ~2 s after an edge boots).
 
 components:
   schemas:
@@ -109,6 +117,28 @@ components:
       minimum: 1
       maximum: 999
       description: Price tick on the 0.1 cent grid (YES contract).
+    epoch:
+      type: [string, "null"]
+      pattern: "^(0|[1-9][0-9]{0,9})$"
+      description: >
+        The feed producer's incarnation (quoted u32) — the namespace
+        update_seq lives in. A producer restart advances it and
+        re-bases update_seq; splice and compare coordinates
+        epoch-scoped, never across epochs. Null only before this edge
+        has seen any feed frame.
+    update_seq:
+      type: [string, "null"]
+      pattern: "^(0|[1-9][0-9]{0,19})$"
+      description: >
+        The venue-authored update coordinate (quoted u64; null only
+        before this edge has seen any feed frame). On a delta: the
+        emitting update's own; on sub_ok/stale/live: the newest
+        coordinate the stream has carried. Identical across every edge
+        box and the history REST rows; strictly increasing on the
+        deltas a connection receives but NOT dense per market —
+        connection loss detection stays seq. The coordinate exists to
+        splice a history anchor into the stream and to line up two
+        connections.
     market_state:
       type: string
       enum: [created, open, closed, settled]
@@ -120,8 +150,8 @@ components:
         Byte-exact payload (fixed key order, no whitespace) — strict
         decode, anything else closes 1008. Follow the venue default
         market (a rollover moves this surface with no client action).
-        While following it is a re-sub: fresh snapshot, same seq chain
-        (the recovery verb).
+        While following it is a re-sub: fresh sub_ok anchor, same seq
+        chain (the recovery verb).
     client_sub_market:
       type: string
       pattern: '^\{"type":"sub","market_id":"[1-9][0-9]{0,9}"\}$'
@@ -131,9 +161,9 @@ components:
         sign, fits u32, not 0; any deviation closes 1008). Up to 8
         pins per connection beside the default follow; the 9th
         distinct pin closes 1008 without stamping anything. An
-        unannounced market is accepted (empty snapshot — it may open
-        later). While pinned it is a re-sub: fresh snapshot of that
-        market, same chain.
+        unannounced market is accepted (sub_ok with null card fields —
+        it may open later). While pinned it is a re-sub: fresh sub_ok
+        for that market, same chain.
     client_unsub:
       type: string
       const: '{"type":"unsub"}'
@@ -147,37 +177,6 @@ components:
       description: >
         Remove the one pin on that market; a no-op if absent. The
         default follow and other pins are untouched.
-
-    level:
-      type: object
-      required: [price, qty, orders]
-      additionalProperties: false
-      properties:
-        price: { $ref: "#/components/schemas/price_tick" }
-        qty: { $ref: "#/components/schemas/quoted_u64" }
-        orders:
-          type: integer
-          minimum: 0
-          description: Resting orders at the level; 0 exactly when qty is "0".
-
-    trade:
-      type: object
-      required: [book_seq, fill_index, price, qty, taker_side, ts_ms]
-      additionalProperties: false
-      properties:
-        book_seq:
-          $ref: "#/components/schemas/quoted_u64"
-          description: Owning command's per-market sequence; with fill_index the trade's unique identity, and the ordering authority.
-        fill_index: { type: integer, minimum: 0 }
-        price: { $ref: "#/components/schemas/price_tick" }
-        qty: { $ref: "#/components/schemas/quoted_u64" }
-        taker_side:
-          type: string
-          enum: [buy, sell]
-          description: Which way the aggressor traded YES.
-        ts_ms:
-          $ref: "#/components/schemas/quoted_u64"
-          description: Producer wall stamp, ms; display only, never ordering. "0" = no stamp.
 
     stats:
       type: object
@@ -203,47 +202,36 @@ components:
             - { type: "null" }
           description: Null before the first trade.
 
-    server_snapshot:
+    server_sub_ok:
       type: object
       description: >
-        Full one-market state, named by its market_id. First frame
-        after every (re-)sub; also pushed unsolicited to that market's
-        subscribers after its keyframe heal or a producer restart, and
-        to default followers after a market rollover. Means "live
-        prices" unless immediately followed by server_stale on the
-        same chain.
-      required: [type, seq, market_id, state, settled_outcome, settle_price,
-                 opened_at_ms, closes_at_ms, tick_step, bids, asks, trades,
-                 stats, now_ms]
+        The subscription acknowledgement and splice anchor: the
+        answered market's identity and lifecycle card plus the stream
+        coordinate the stream is current through. Carries NO book,
+        tape, stats, window stamps, or settlement resolution — the
+        history REST plane owns state.
+      required: [type, seq, market_id, epoch, update_seq, state,
+                 suspect, tick_step, stale, now_ms]
       additionalProperties: false
       properties:
-        type: { type: string, const: snapshot }
+        type: { type: string, const: sub_ok }
         seq: { $ref: "#/components/schemas/quoted_u64" }
-        market_id: { $ref: "#/components/schemas/market_id" }
+        market_id:
+          $ref: "#/components/schemas/market_id"
+          description: The answered market — the pinned id, or the venue default; null before the feed has named any market.
+        epoch: { $ref: "#/components/schemas/epoch" }
+        update_seq: { $ref: "#/components/schemas/update_seq" }
         state:
           oneOf:
             - { $ref: "#/components/schemas/market_state" }
             - { type: "null" }
-          description: Null if no lifecycle card seen. Gate order entry on "open".
-        settled_outcome:
-          oneOf:
-            - { type: string, enum: [yes_won, no_won, void, settled_at_price] }
-            - { type: "null" }
+          description: The market's lifecycle card as this edge knows it; null for an unannounced market. Gate order entry on "open".
+        suspect:
+          type: boolean
           description: >
-            The served market's resolution; non-null only when state is
-            "settled". Carried in the snapshot so a client that missed
-            the settled lifecycle delta (or connected after settlement)
-            still learns it — re-sub is the whole recovery verb.
-        settle_price:
-          oneOf:
-            - { $ref: "#/components/schemas/price_tick" }
-            - { type: "null" }
-          description: Non-null only for settled_at_price.
-        opened_at_ms:
-          oneOf: [{ $ref: "#/components/schemas/quoted_u64" }, { type: "null" }]
-        closes_at_ms:
-          oneOf: [{ $ref: "#/components/schemas/quoted_u64" }, { type: "null" }]
-          description: Advisory window stamp — the venue's sequenced close is the authority.
+            The producer's own caution flag: while true this market's
+            mirror may have missed updates the repair plane could not
+            recover — render with the same caution as stale.
         tick_step:
           oneOf:
             - { type: integer, minimum: 1, maximum: 500 }
@@ -251,55 +239,51 @@ components:
           description: >
             The market's price-grid step in 0.1 cent units — a divisor
             of 1000 below it (1 = the full grid, 10 = whole cents).
-            The gateway rejects off-step order prices with off_tick;
-            build order forms on this grid, but render any level the
-            book serves (the engine never re-checks resting prices).
+            The gateway rejects off-step order prices with off_tick.
             Null until this edge has learned the market's grid.
-        bids:
-          type: array
-          maxItems: 200
-          items: { $ref: "#/components/schemas/level" }
-          description: Best-first (descending price), nonzero levels only.
-        asks:
-          type: array
-          maxItems: 200
-          items: { $ref: "#/components/schemas/level" }
-          description: Best-first (ascending price), nonzero levels only.
-        trades:
-          type: array
-          maxItems: 200
-          items: { $ref: "#/components/schemas/trade" }
-          description: Newest-first.
-        stats: { $ref: "#/components/schemas/stats" }
+        stale:
+          type: boolean
+          description: >
+            Whether served prices are currently flagged not-live — the
+            in-band form of the stale frame, for subscribers who were
+            not connected when it broadcast.
         now_ms:
           $ref: "#/components/schemas/quoted_u64"
-          description: Server wall clock at build time (client skew estimation).
+          description: Server wall clock at answer time (client skew estimation).
 
     server_delta:
       type: object
       description: >
-        One incremental event, discriminated by kind. Book deltas carry
-        the level's new ABSOLUTE state (overwrite, never add; qty "0" =
-        level gone). Lifecycle advances are monotone, with one
-        exception: a same-state lifecycle delta may restate once when
-        its only news is a late-learned tick_step. A mid-life grid
-        refinement arrives as kind=tick_step_change (or, when it is
-        first learned from an advancing card, as that lifecycle
-        delta's finer tick_step).
-      required: [type, seq, market_id, kind]
+        One relayed feed update, discriminated by kind. Book deltas
+        carry the level's new ABSOLUTE state (overwrite, never add;
+        qty "0" = level gone). Trades dedup on (book_seq, fill_index)
+        — keyframe sweeps restate recent prints. EVERY lifecycle card
+        relays, restatements included: apply absolutely, keyed by the
+        delta's market_id (a null tick_step or window stamp never
+        erases a learned value — it means the producer did not know).
+        keyframe_begin/keyframe_end bracket the producer's periodic
+        full restatement of one market: the sweep's level and trade
+        restatements arrive as ordinary book/trade deltas between the
+        brackets, and at keyframe_end a stateful client deletes any
+        held level of that market no delta touched inside the bracket
+        (its delete was lost upstream). Clients holding no book ignore
+        the brackets.
+      required: [type, seq, epoch, update_seq, market_id, kind]
       properties:
         type: { type: string, const: delta }
         seq: { $ref: "#/components/schemas/quoted_u64" }
+        epoch: { $ref: "#/components/schemas/epoch" }
+        update_seq: { $ref: "#/components/schemas/update_seq" }
         market_id:
           $ref: "#/components/schemas/market_id"
           description: >
-            For kind=lifecycle this is the advancing CARD's market and
-            can differ from the served market (a predecessor's late
-            settle beside the live successor) — key lifecycle state by
-            market_id.
+            The frame's own market — key all state by it. For
+            kind=lifecycle it is the advancing CARD's market and can
+            differ from any served market (a predecessor's late settle
+            beside the live successor).
         kind:
           type: string
-          enum: [book, trade, stats, lifecycle, tick_step_change]
+          enum: [book, trade, stats, lifecycle, keyframe_begin, keyframe_end]
         side:
           type: string
           enum: [bid, ask]
@@ -316,12 +300,15 @@ components:
           description: kind=book only.
         book_seq:
           $ref: "#/components/schemas/quoted_u64"
-          description: kind=trade only.
+          description: kind=trade only; with fill_index the trade's unique identity and dedup key, and the ordering authority.
         fill_index: { type: integer, minimum: 0, description: kind=trade only. }
-        taker_side: { type: string, enum: [buy, sell], description: kind=trade only. }
-        ts_ms: { $ref: "#/components/schemas/quoted_u64", description: kind=trade only; "0" = no stamp. }
+        taker_side: { type: string, enum: [buy, sell], description: kind=trade only — which way the aggressor traded YES. }
+        ts_ms: { $ref: "#/components/schemas/quoted_u64", description: kind=trade only; "0" = no stamp; display only, never ordering. }
         stats: { $ref: "#/components/schemas/stats", description: kind=stats only; overwrite whole. }
         state: { $ref: "#/components/schemas/market_state", description: kind=lifecycle only. }
+        suspect:
+          type: boolean
+          description: kind=lifecycle only; the producer's caution flag for this market.
         settled_outcome:
           oneOf:
             - { type: string, enum: [yes_won, no_won, void, settled_at_price] }
@@ -332,46 +319,60 @@ components:
             - { $ref: "#/components/schemas/price_tick" }
             - { type: "null" }
           description: kind=lifecycle only; non-null only for settled_at_price.
+        opened_at_ms:
+          oneOf: [{ $ref: "#/components/schemas/quoted_u64" }, { type: "null" }]
+          description: kind=lifecycle only; advertised window stamp, null while unknown.
+        closes_at_ms:
+          oneOf: [{ $ref: "#/components/schemas/quoted_u64" }, { type: "null" }]
+          description: kind=lifecycle only; advisory — the venue's sequenced close is the authority.
         tick_step:
           oneOf:
             - { type: integer, minimum: 1, maximum: 500 }
             - { type: "null" }
           description: >
-            kind=lifecycle only. The market's price-grid step in 0.1
-            cent units — a divisor of 1000 below it (1 = the full
-            grid, 10 = whole cents); null while the edge has not yet
-            learned it. The gateway rejects off-step order prices with
-            off_tick.
-        old_tick_step:
+            kind=lifecycle only. The market's price-grid step; null
+            while the producer has not learned it. A mid-life grid
+            refinement arrives as a same-state card carrying the finer
+            step.
+        keyframe_id:
+          $ref: "#/components/schemas/quoted_u64"
+          description: kind=keyframe_begin and kind=keyframe_end; pairs the bracket.
+        level_count:
           type: integer
-          minimum: 2
-          maximum: 500
-          description: >
-            kind=tick_step_change only. The step the market held
-            before the refinement.
-        new_tick_step:
+          minimum: 0
+          description: kind=keyframe_end only; distinct levels the sweep restated.
+        trade_count:
           type: integer
-          minimum: 1
-          maximum: 250
-          description: >
-            kind=tick_step_change only. The refined step; always
-            strictly divides old_tick_step (a refinement makes the
-            grid finer, never coarser), so every resting order's
-            price is already on the new grid — nothing is cancelled
-            by a refinement.
+          minimum: 0
+          description: kind=keyframe_end only; tape rows the sweep restated.
 
     server_stale:
       type: object
       description: >
-        Served prices are not live (upstream feed gapped or went
-        quiet). Stream-scoped — it applies to every market this
-        connection renders (its market_id stamp is the venue default
-        and must not scope the warning); each market clears
-        implicitly on its own next server_snapshot — there is no
-        "unstale" frame. Prices are flagged, never frozen.
-      required: [type, seq, market_id]
+        Served prices are not live (the upstream feed gapped, went
+        quiet, or restarted). Stream-scoped — it applies to every
+        market this connection renders (the lost span could have
+        carried any market's frames). Cleared by server_live; late
+        subscribers learn the current flag from sub_ok.stale. Prices
+        are flagged, never frozen.
+      required: [type, seq, epoch, update_seq]
       additionalProperties: false
       properties:
         type: { type: string, const: stale }
         seq: { $ref: "#/components/schemas/quoted_u64" }
-        market_id: { $ref: "#/components/schemas/market_id" }
+        epoch: { $ref: "#/components/schemas/epoch" }
+        update_seq: { $ref: "#/components/schemas/update_seq" }
+
+    server_live:
+      type: object
+      description: >
+        A complete keyframe sweep re-proved the stream — clear the
+        stale flag. Sent only to subscribers who could have seen the
+        stale condition; a fresh sub learns the flag from its sub_ok.
+      required: [type, seq, epoch, update_seq]
+      additionalProperties: false
+      properties:
+        type: { type: string, const: live }
+        seq: { $ref: "#/components/schemas/quoted_u64" }
+        epoch: { $ref: "#/components/schemas/epoch" }
+        update_seq: { $ref: "#/components/schemas/update_seq" }

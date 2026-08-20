@@ -1,15 +1,16 @@
 ---
 title: "Tiny Exchange internal docs"
-description: "The integration entry point for the draft v8 trading API."
+description: "The integration entry point for the draft v9 trading API."
 icon: "house"
 ---
 
-Tiny Exchange exposes a strict REST and WebSocket trading surface in front of a
-single-owner risk core. Use these docs to build clients, reason about fees, and
+Tiny Exchange exposes a strict REST trading surface in front of a single-owner
+risk core, with live account events delivered on a separate authenticated
+WebSocket tier. Use these docs to build clients, reason about fees, and
 recover safely after disconnects or ambiguous responses.
 
 <Warning>
-The v8 API is a working draft for the bare-metal test phase. The Rust codec in
+The v9 API is a working draft for the test-fleet phase. The Rust codec in
 `protocol/external` defines the accepted bytes. The OpenAPI document describes
 fields and behavior, but cannot express fixed JSON key order, whitespace bans,
 or byte-identical retry rules.
@@ -22,20 +23,23 @@ or byte-identical retry rules.
   <Card title="Authentication and wire" icon="key" href="/authentication-and-wire">
     Construct tokens and canonical frames without normalization bugs.
   </Card>
+  <Card title="REST trading and the heartbeat deadman" icon="bolt" href="/rest-trading">
+    Submit, cancel, modify, snapshot, and arm per-account order protection.
+  </Card>
+  <Card title="Account events WebSocket" icon="lock" href="/account-events">
+    Consume the live private event stream and detect delivery gaps by sequence.
+  </Card>
   <Card title="Events and recovery" icon="rotate" href="/events-and-recovery">
     Rebuild state from snapshots and apply live events idempotently.
   </Card>
-  <Card title="Private trading WebSocket" icon="lock" href="/websocket-trading">
-    Authenticate, send commands, consume account events, and multiplex operators.
-  </Card>
   <Card title="Multi-strategy runners" icon="layer-group" href="/multi-strategy">
-    Anchor N accounts on one operator session; understand the dead-runner sweep.
+    Trade N accounts over REST, batch their heartbeats, and multiplex their events.
   </Card>
   <Card title="Operator provisioning" icon="id-card" href="/operator-provisioning">
-    Mint operator keys, connect to the core, and add trading accounts.
+    Mint operator keys, reach the right hosts, and add trading accounts.
   </Card>
   <Card title="Public market-data WebSocket" icon="chart-line" href="/websocket-market-data">
-    Subscribe to books and trades with gapless sequencing and snapshot recovery.
+    Subscribe to the relayed feed and splice state from the history REST plane.
   </Card>
   <Card title="Fees" icon="coins" href="/fees">
     Implement the taker charge, admission reserve, and refund accounting exactly.
@@ -49,7 +53,8 @@ When sources disagree, use this order:
 - `protocol/external` for canonical JSON parsing, encoding, and frame limits.
 - `protocol/types/src/fees.rs` for fee arithmetic and rounding.
 - `services/gateway/src/risk` for admission, balance, reserve, and fill policy.
-- `api/external/openapi-*.yaml` for the trading and public market-data surfaces.
+- `api/external/openapi-*.yaml` for the trading, market-data, and history
+  surfaces.
 - These pages for integration guidance derived from those sources.
 
 ## Non-negotiable client rules
@@ -59,10 +64,14 @@ When sources disagree, use this order:
 - Preserve the exact bytes of a submitted `new_order` until its `valid_until`
   deadline. A retry is the same bytes, not a reconstructed equivalent object.
 - Treat HTTP `202` as durable submission, not execution or booking.
-- Recover from a fresh snapshot before consuming a new live event stream.
+- Recover from a fresh snapshot before consuming a new live event stream, and
+  resume the stream strictly above the snapshot's `event_seq` anchor.
 - Deduplicate fills by `(market_id, book_seq, fill_index)` and apply absolute
   `remaining`, position, and balance values.
 - Order only sequenced market events by `book_seq`. `ts_ms` is observational.
+- If you rely on the venue clearing your orders when your process dies, arm the
+  heartbeat deadman (`POST /v1/heartbeat`) and keep beating — no transport
+  disconnect arms or fires anything.
 
 ## Local preview
 

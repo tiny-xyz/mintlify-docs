@@ -1,27 +1,29 @@
 ---
 title: "Operator provisioning"
-description: "Mint operator keys, connect to the core, and add trading accounts."
+description: "Mint operator keys, reach the right hosts, and add trading accounts."
 icon: "id-card"
 ---
 
 Operator scope is venue infrastructure. This page covers what the venue and a
-contracted runner do off the wire: key custody, where operator sessions
-connect, and how a new trading account comes to exist. The wire itself is the
-ordinary v8 surface plus the subscription vocabulary — see
-[the private trading WebSocket](/websocket-trading) and
+contracted runner do off the wire: key custody, which hosts resolve operator
+tokens, and how a new trading account comes to exist. The wire itself is the
+ordinary v9 surface — cross-account REST plus the events-side subscription
+vocabulary — see
+[REST trading and the heartbeat deadman](/rest-trading),
+[the account events WebSocket](/account-events), and
 [the multi-strategy runner model](/multi-strategy).
 
 ## Two key stores, one scope rule
 
 The gateway loads two id-disjoint `tiny-keys-v1` files at boot: `--keys` for
-client sessions (also deployed to shell fronts) and `--operator-keys` for
-operator sessions (gateway core only). Boot refuses an ID overlap, so which
-store resolves a token's `key_id` decides the session scope for its whole
-life. Nothing inside the token chooses.
+client tokens (also deployed to shell fronts) and `--operator-keys` for
+operator tokens. Boot refuses an ID overlap, so which store resolves a
+token's `key_id` decides the request's scope. Nothing inside the token
+chooses.
 
 Key files are `<key_id> <128hex>` lines with `#` comments, `0600`
 permissions required, loaded once at boot. Adding, removing, or rotating a
-key is a gateway restart, and removal is the only revocation — tokens verify
+key is a service restart, and removal is the only revocation — tokens verify
 locally with no callback.
 
 ## Minting
@@ -29,37 +31,44 @@ locally with no callback.
 <Steps>
   <Step title="Generate a key">
     `tiny-gateway-keytool gen <key_id>` emits one key-file line from OS
-    entropy. Append it to the operator store on the gateway box and restart
-    the gateway.
+    entropy. Append it to the operator store on the boxes that hold it and
+    restart them.
   </Step>
   <Step title="Mint the token">
     `tiny-gateway-keytool mint --keys <operator-store> --key-id <n>
-    --account <n> --expires-at <wall-ns>` emits the canonical `auth` frame
-    and its hex header form. The minted account is the operator's own auth
-    identity: it pays the operator's `listen`/`unlisten` rate charge and
-    needs no funding — trading authority comes from each frame's body
-    account.
+    --account <n> --expires-at <wall-ns>` emits the canonical v9 `auth`
+    frame and its hex header form. The minted account is the operator's own
+    auth identity: it pays the operator's request-rate charge and needs no
+    funding — trading authority comes from each request's body account.
   </Step>
   <Step title="Deliver out of band">
     Hand the runner the token, or the key line if the runner mints its own
-    rotations. `expires_at` bounds the token's life; at expiry the session
-    closes `1008` and the runner reconnects with a fresh token, so
-    short-lived tokens rotate with no venue action.
+    rotations. `expires_at` bounds the token's life; at expiry REST answers
+    `401` and the events socket closes `1008`, and the runner continues with
+    a fresh token — short-lived tokens rotate with no venue action.
   </Step>
 </Steps>
 
-Minted frames carry `cancel_on_disconnect_ms` `0`. The field sits outside the
-signature domain, so the runner re-encodes the signed fields with its own
-window without re-minting.
+## Which hosts resolve operator tokens
 
-## Connect to the core, not a shell
+The operator store is deployed to exactly two places, and each unlocks a
+different capability:
 
-The operator store is never deployed to shell fronts, so an operator token
-presented to a shell fails with `auth_failed` `unknown_key`. Dial the gateway
-core's own listen address on the private network; `ops/deploy/colo.toml` in
-the exchange repository is the address authority. REST with an operator token
-serves single-account semantics only — cross-account authority and
-subscriptions are WebSocket session state.
+- **The gateway core's own listen address** — operator REST: cross-account
+  orders, cancels, modifies, heartbeat batches, and `GET
+  /v1/orders/{account}` snapshots. Shell fronts never hold the operator
+  store, so an operator token presented to a shell fails `auth_failed`
+  `unknown_key`. Dial the core directly on the private network;
+  `ops/deploy/colo.toml` in the exchange repository is the address
+  authority.
+- **The account-edge tier** (when started with `--operator-keys`) — operator
+  events sessions: `listen`/`unlisten` multiplexing on the events WebSocket.
+- The history service accepts the same tokens for cross-account
+  `GET /v1/history/account-events?account=` replay.
+
+Trading authority and event subscriptions are independent planes: an
+operator trades accounts it does not listen to (and hears nothing about
+them), and listens to accounts it never trades.
 
 ## Adding a new trading account
 
@@ -72,27 +81,29 @@ migration, never an ordinary restart.
 - **Venue:** add the funding line, run the migration, confirm the account ID
   to the runner. No new keys — operator scope already reaches every
   ledger-known account.
-- **Runner:** `listen` the account's canonical address (the `u64` ID
-  big-endian in the last 8 bytes, zeros elsewhere). The admitted baseline
-  bracket restates its starting balances; trade from then on.
+- **Runner:** trade the account's canonical address (the `u64` ID big-endian
+  in the last 8 bytes, zeros elsewhere) over REST, `listen` it on the events
+  socket, include it in the heartbeat batch if it should be swept on runner
+  death, and reconcile its baseline from `GET /v1/orders/{account}`.
 
-A per-account client token — for a direct client session beside the
+A per-account client token — for a direct client integration beside the
 operator's — is a separate mint against the client store and is never
 required for operator trading.
 
 ## Deployed capacities
 
-Defaults; the gateway flags and `ops/deploy/colo.toml` are the per-deploy
+Defaults; the service flags and `ops/deploy/colo.toml` are the per-deploy
 authority.
 
-| Capacity | Default | Flag |
+| Capacity | Default | Where |
 | --- | ---: | --- |
-| Operator session slots (structural max 64) | 4 | `--operator-sessions` |
-| Egress frames per operator slot | 32,768 | `--operator-egress-slots` |
-| Listened-account subscription rows, venue-wide | 4,096 | `--subscription-slots` |
-| Accounts per `listen`/`unlisten` frame | 10 | frame budget, not policy |
-| Requests per second per account | 30 | `--account-msgs-per-sec` |
+| Accounts per `heartbeat`/`listen`/`unlisten` frame | 10 | frame grammar |
+| Requests per second per account (gateway REST) | 30 | gateway `--account-msgs-per-sec` |
+| Operator events sessions per account-edge box | 4 | account-edge `--operator-sessions` |
+| Egress frames per operator events session | 32,768 | account-edge `--operator-egress-slots` |
+| Listened-account subscription rows per box | 4,096 | account-edge `--subscription-slots` |
+| Sessions watching one account on one box | 8 | fixed subscriber row |
 
-Egress overflow closes `1013`: back off, reconnect, re-listen, and
-reconcile from the fresh brackets. The subscription table sits outside the
-replay fingerprint, so resizing it is an ordinary restart.
+Events-egress overflow closes `1013`: back off, reconnect, re-listen, and
+reconcile via snapshot-then-splice. Account-edge boxes are cloned — capacity
+scales by adding boxes, and no venue state lives on them.

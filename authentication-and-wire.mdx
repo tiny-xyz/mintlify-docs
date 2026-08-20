@@ -1,12 +1,12 @@
 ---
 title: "Authentication and canonical wire"
-description: "Create Tiny-v1 credentials and encode strict v8 frames."
+description: "Create Tiny-v1 credentials and encode strict v9 frames."
 icon: "key"
 ---
 
-Authenticated REST requests send a `Tiny-v1` authorization value. WebSocket
-connections send the decoded auth frame as their first text message after the
-upgrade.
+Authenticated REST requests send a `Tiny-v1` authorization value on every
+request. The account-events WebSocket sends the decoded auth frame as its
+first text message after the upgrade.
 
 ## Authorization header
 
@@ -19,7 +19,7 @@ Authorization: Tiny-v1 <hex-encoded-canonical-auth-frame>
 The decoded bytes are exactly:
 
 ```json
-{"version":8,"type":"auth","body":{"account":"42","expires_at":"1730000000000000000","key_id":1,"cancel_on_disconnect_ms":0,"sig":"<128-lowercase-hex>"}}
+{"version":9,"type":"auth","body":{"account":"42","expires_at":"1730000000000000000","key_id":1,"sig":"<128-lowercase-hex>"}}
 ```
 
 The signature is HMAC-SHA512 over:
@@ -29,45 +29,50 @@ tiny-auth-v1:<account>:<expires_at>:<key_id>
 ```
 
 Use the secret selected by `key_id`. The key store that resolves the ID fixes
-the session scope: client tokens are bound to one account, while venue operator
-tokens can subscribe to and trade for multiple ledger-known accounts.
+the request's scope: client tokens are bound to one account, while venue
+operator tokens act for any ledger-known account per request. Nothing inside
+the token chooses.
 
 <Note>
-`cancel_on_disconnect_ms` is intentionally outside the HMAC message. It is
-session policy: `0` disables the sweep; otherwise the accepted range is
-`3000..=600000` milliseconds. On a client session the window protects the
-token's own account; on an operator session the one window on the auth
-covers every account the session goes on to `listen` — see
-[the multi-strategy runner model](/multi-strategy) for the full sweep
-semantics.
+The auth body carries no order-protection policy. Disconnects arm nothing and
+fire nothing — order protection is the per-account heartbeat deadman on
+`POST /v1/heartbeat`, described in
+[REST trading and the heartbeat deadman](/rest-trading#the-heartbeat-deadman).
 </Note>
 
 ## REST authority
 
 For ordinary client requests, the address in the command body must embed the
-same account as the token. A mismatch rejects as `wrong_account`. REST remains
-per-request client-token authority even when operator WebSocket support is
-enabled.
+same account as the token. A mismatch rejects as `wrong_account`.
+
+For operator requests, the body account is the effective account, judged per
+request: admission, funds, and sanctions all judge the body account, and a
+body account the ledger does not know rejects `unknown_account`. Cross-account
+authority is per-request REST scope — there is no session to anchor it to.
 
 The 65-byte `sig` inside new and modified orders is a future settlement
 signature slot. It is carried and journaled but not verified by the current
 gateway. Send exactly 130 lowercase hex characters; zeroes are legal during
 this phase.
 
-## WebSocket authentication
+## WebSocket authentication (account events)
+
+The events WebSocket lives on the account-edge tier, not the trading hosts.
 
 <Steps>
   <Step title="Open a fresh connection">
-    Upgrade `GET /v1/ws` on a TCP connection that has not served an
-    authenticated REST request.
+    Upgrade `GET /v1/ws` on the account-edge host, on a TCP connection that
+    has not served an authenticated REST request.
   </Step>
   <Step title="Send auth first">
     The first text frame must be the canonical auth JSON, not the hex-encoded
     header form.
   </Step>
-  <Step title="Wait for the baseline">
-    After `auth_ok`, consume the complete snapshot bracket before treating live
-    events as current state.
+  <Step title="Expect no baseline">
+    `auth_ok` confirms the session account and live events follow. The
+    delivery tier holds no state: snapshot over REST, then splice the stream
+    above the snapshot's `event_seq` anchor — see
+    [the account events WebSocket](/account-events).
   </Step>
 </Steps>
 
@@ -83,7 +88,7 @@ closes with code `1008`; event backpressure closes with `1013`.
   strings: no sign and no leading zeroes.
 - Emit JSON booleans as bare `true` or `false`.
 - Never emit floating-point values.
-- Keep each frame at or below 552 bytes.
+- Keep each frame at or below 587 bytes.
 - Do not add fields for forward compatibility; unknown fields reject.
 
 <Warning>
@@ -94,10 +99,11 @@ into a fresh order. Retain and replay the original byte buffer.
 
 ## Operator subscriptions
 
-Operator sessions start with a venue-board snapshot and no account event
-subscriptions: `listen` each account before trading it, and re-listen after
-every reconnect. The full contract — batching, per-account verdicts,
-baselines, and the dead-runner sweep — lives in
-[the private trading WebSocket](/websocket-trading#operator-multiplexing) and
+Operator event multiplexing (`listen`/`unlisten`) is account-edge WebSocket
+vocabulary, unrelated to trading authority: subscribe each account whose
+events you want, and trade any ledger-known account over REST regardless. The
+full contract — batching, per-account verdicts, and the empty confirmation
+bracket — lives in
+[the account events WebSocket](/account-events#operator-multiplexing) and
 [the multi-strategy runner model](/multi-strategy); key minting lives in
 [Operator provisioning](/operator-provisioning).

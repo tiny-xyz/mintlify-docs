@@ -1,46 +1,69 @@
 ---
 title: "Trading API overview"
-description: "Transport boundaries, data model, and command lifecycle for v8 clients."
+description: "Transport boundaries, data model, and command lifecycle for v9 clients."
 icon: "diagram-project"
 ---
 
-The gateway uses REST for commands and snapshots plus WebSocket for the live
-private event stream. Separate edge servers expose the public market-data
-WebSocket. Both surfaces use strict canonical integer JSON with different
-envelopes and message vocabularies, so ordinary JSON equivalence is not enough.
+Trading is REST-only: every command and snapshot is an HTTP request against
+the gateway (through its stateless shell fronts). Live private events arrive
+on a separate authenticated WebSocket served by the account-edge delivery
+tier, public books and trades on the edge market-data WebSocket, and stored
+state on the history REST plane. All surfaces use strict canonical integer
+JSON with different envelopes and message vocabularies, so ordinary JSON
+equivalence is not enough.
 
 ## Surface
 
 | Purpose | Transport | Route | Success meaning |
 | --- | --- | --- | --- |
 | Submit an order | REST | `POST /v1/orders` | Validated, collateral locked, and durably published |
-| Rebuild account state | REST | `GET /v1/orders` | Ordered NDJSON snapshot completed |
-| Modify price | REST | `POST /v1/modify` | Command durably forwarded |
 | Cancel one order | REST | `POST /v1/cancel` | Command durably forwarded |
+| Rebuild account state | REST | `GET /v1/orders` | Anchored NDJSON snapshot completed |
+| Rebuild another account's state (operator) | REST | `GET /v1/orders/{account}` | Anchored NDJSON snapshot completed |
+| Modify price | REST | `POST /v1/modify` | Command durably forwarded |
 | Cancel all open orders | REST | `POST /v1/cancel-all` | All generated cancels durably forwarded |
-| Receive private events | WebSocket | `GET /v1/ws` | Upgrade only; authenticate in the first text frame |
-| Receive public books and trades | WebSocket | `GET /v1/stream` | Upgrade only; send an exact subscription message |
+| Arm, re-anchor, or disarm order protection | REST | `POST /v1/heartbeat` | The whole batch armed, re-anchored, or disarmed |
+| Receive private events | WebSocket | `GET /v1/ws` (account-edge host) | Upgrade only; authenticate in the first text frame |
+| Receive public books and trades | WebSocket | `GET /v1/stream` (edge host) | Upgrade only; send an exact subscription message |
+| Replay stored feed rows and account events | REST | `GET /v1/history/*` (history host) | Cursor-paged rows from the store |
 | Check front health | REST | `GET /v1/status` | An answering front has a live command path |
 
 `202 Accepted` never means the order booked or filled. The definitive result is
 an event such as `order_accepted`, `fill`, `modify_done`, `cancel_done`, or
-`order_rejected`.
+`order_rejected`, delivered on the account-events stream or visible in the
+next snapshot.
+
+<Note>
+The trading hosts serve no WebSocket: `GET /v1/ws` on a gateway or shell front
+answers `404`. The events WebSocket lives on the account-edge tier — a
+different host, same tokens.
+</Note>
 
 ## Frame envelopes
 
 Client frames contain `version`, `type`, then `body`:
 
 ```json
-{"version":8,"type":"cancel_order","body":{"account":"000000000000000000000000000000000000002a","market_id":"0000000000000000000000000000000000000000000000000000000000000005","order_id":"281474976710663"}}
+{"version":9,"type":"cancel_order","body":{"account":"000000000000000000000000000000000000002a","market_id":"0000000000000000000000000000000000000000000000000000000000000005","order_id":"281474976710663"}}
 ```
 
 Server frames insert `ts_ms` between `type` and `body`:
 
 ```json
-{"version":8,"type":"venue_status","ts_ms":"1730000000000","body":{"mode":"open"}}
+{"version":9,"type":"venue_status","ts_ms":"1730000000000","body":{"mode":"open"}}
 ```
 
-Frames are at most 552 bytes. Keys have a fixed order; whitespace, floats,
+Frames delivered on the account-events stream additionally carry `event_seq`
+between `ts_ms` and `body` — the account's dense per-account delivery stamp:
+
+```json
+{"version":9,"type":"fill","ts_ms":"1730000000000","event_seq":"12","body":{"...":"..."}}
+```
+
+A numeric gap in `event_seq` means missed delivery; recover with a fresh
+snapshot. REST response bodies and snapshot lines never carry `event_seq`.
+
+Frames are at most 587 bytes. Keys have a fixed order; whitespace, floats,
 unknown keys, duplicate keys, reordered keys, and non-canonical numeric forms
 are refused.
 
@@ -71,9 +94,9 @@ buy NO at `p` becomes sell YES at `1000 - p`.
     worst-case fee are already locked for the cash-backed opening remainder.
   </Step>
   <Step title="Observe the engine verdict">
-    Wait for `order_accepted`, `order_rejected`, and any fills on the WebSocket
-    stream. An accepted order may fill immediately before any resting state is
-    useful to the client.
+    Wait for `order_accepted`, `order_rejected`, and any fills on the
+    account-events stream. An accepted order may fill immediately before any
+    resting state is useful to the client.
   </Step>
   <Step title="Track terminal state">
     An order ends when fills drive `remaining` to zero, or on `cancel_done`,
@@ -94,10 +117,12 @@ buy NO at `p` becomes sell YES at `1000 - p`.
 - A repeated modify with the same `modify_seq` can return `stale_modify`; that
   means the original sequence already applied. Resume above the snapshot's
   last applied sequence.
+- A repeated heartbeat re-anchors the same deadline it would have anyway.
+  Repeat a `504` beat freely.
 
 ## Specification boundary
 
-The API reference tab is generated from the trading and edge OpenAPI documents
-under `api/external`. Use it for field shapes and endpoint responses. Use the
-canonical codec for trading-frame byte construction and the WebSocket guides
-for stream-specific state application.
+The API reference tab is generated from the trading, edge, and history
+OpenAPI documents under `api/external`. Use it for field shapes and endpoint
+responses. Use the canonical codec for trading-frame byte construction and
+the stream guides for stream-specific state application.

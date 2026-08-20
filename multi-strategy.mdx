@@ -1,127 +1,102 @@
 ---
 title: "Running more than one strategy"
-description: "One operator session anchors liveness and dead-runner protection for every strategy."
+description: "One runner, N accounts: REST trading, batched heartbeats, and one event socket."
 icon: "layer-group"
 ---
 
 The venue has no strategy concept — the **account** is the unit of
-everything: funds, risk, resting orders, and the cancel-on-disconnect
+everything: funds, risk, resting orders, and the heartbeat deadman's
 sweep. That gives a clean isolation rule and one operational pattern.
 
 ## Rule one: one account per strategy
 
 A sweep, a `cancel_all`, and a balance are all account-wide. If two
-strategies share an account, they share fate: one strategy's
-disconnect protection clears the other's orders, and their PnL is
-indistinguishable. Give each strategy its own account; the operator
-plane below makes the fan-out cheap.
+strategies share an account, they share fate: one strategy's deadman
+lapse clears the other's orders, and their PnL is indistinguishable.
+Give each strategy its own account; the operator plane below makes the
+fan-out cheap.
 
-## The shape: one operator session, N trading accounts
+## The shape: REST + heartbeats + one event socket
 
 A runner driving N strategies runs:
 
-- **One operator WS session** — authenticated with an operator-scope
-  token — that `listen`s every trading account. This single
-  connection is the runner's liveness anchor and its event feed:
-  order lifecycle, fills, fees, and balance events for every listened
-  account arrive here, each frame tagged with its account.
-- **REST for trading** — orders and cancels are per-request
-  authenticated (`Authorization: Tiny-v1 HEX` with each account's own
-  token), so N strategies trade concurrently over plain HTTP with no
-  per-account socket to keep alive.
+- **REST for trading** — one operator-scope token acts for any
+  ledger-known account per request (the body's `account` is the
+  effective account), so N strategies trade concurrently over plain
+  HTTP with nothing per-account to keep alive. Without operator scope,
+  each account's own client token works the same way for that one
+  account.
+- **One heartbeat loop** — `POST /v1/heartbeat` arms and re-anchors up
+  to 10 accounts per frame under one window; a runner beats its whole
+  set in ⌈N/10⌉ requests per cadence tick. This loop — not any socket
+  — is the runner's liveness signal.
+- **One operator events session** — a single account-edge WebSocket
+  that `listen`s every trading account: order lifecycle, fills, fees,
+  and balance events for every listened account arrive here, each
+  frame tagged with its account and stamped with that account's
+  `event_seq`.
 
-One connection to keep alive, one place to read events, N accounts
-trading.
+Trading authority, order protection, and event delivery are three
+independent planes: listening is delivery only, and losing the event
+socket neither disarms nor fires anything.
 
 ### Listening is batched
 
-`listen` takes up to **10 accounts per frame** — distinct, nonzero:
+`listen` takes up to **10 accounts per frame** — distinct, canonical:
 
 ```json
-{"version":8,"type":"listen","body":{"accounts":["...01","...02","...03"]}}
+{"version":9,"type":"listen","body":{"accounts":["...01","...02","...03"]}}
 ```
 
 Verdicts are **per account**, in frame order: one refused account
-voids nothing around it, and each admitted account's baseline
-bracket — closed by its `snapshot_end` — **is** the subscribed
-confirmation. Reconcile from the bracket, then trust the stream.
-The cap is the frame budget, not venue policy: pipeline more frames
-for more accounts. Listens bill the *operator's* rate allowance, so
-a reconnecting runner re-listens hundreds of accounts within a
-couple of rate windows. The full frame contract is in
-[the private trading WebSocket](/websocket-trading#automatic-snapshot).
+voids nothing around it, and each admitted account answers an empty
+confirmation bracket (`snapshot_begin`, then `snapshot_end` naming the
+account with zero counts). The delivery tier restates no state —
+reconcile each account from `GET /v1/orders`, then splice its stream
+above the snapshot's `event_seq` anchor. Pipeline more frames for more
+accounts; the full contract is in
+[the account events WebSocket](/account-events#operator-multiplexing).
 
-## One heartbeat for all of them
+## One heartbeat loop for all of them
 
-The wire heartbeat is per connection — WS ping/pong on each socket,
-documented in [the trading WebSocket](/websocket-trading) — so the operator session is the only
-socket the runner must keep responsive. There is no per-account
-keepalive.
+Dead-runner protection is the per-account deadman, armed and fed over
+REST — see
+[the heartbeat deadman](/rest-trading#the-heartbeat-deadman) for exact
+semantics. The batch is judged whole, one window per frame; a runner
+wanting different windows for different accounts pipelines frames.
 
-Dead-runner protection rides the same session: the
-`cancel_on_disconnect_ms` on the **operator's auth** covers **every
-account it goes on to listen** — nothing rides the listen frames.
+Orders a strategy places while its account is armed are covered by the
+standing deadline — REST trading activity never counts as liveness.
+Only beats do.
 
 ## If the runner dies, every strategy's orders clear
 
-When the operator session ends and no reclaim happens inside the
-window, the venue sweeps **each listened account**: a venue-authored
-`cancel_all` per account, per-order `cancel_done` events with
-`cause: "session_lost"`, funds unlocked on confirmed remaining —
-journaled before publishing, so even a venue crash mid-sweep
-completes on recovery.
-
-The sweep conditions, per account — each is a deliberate handoff
-rule, not a loophole:
-
-| An account is swept only if... | Why |
-|---|---|
-| the dying session was its **last watcher** — no other operator listening, no live client WS session for it | protection hands off to a surviving watcher instead of firing under it |
-| it was still **listened** at the end — not explicitly `unlisten`ed earlier | unlisten is a live runner's choice to release an account, not a lapse |
-| it has at least one **open restable order** | an empty book arms nothing |
-
-Reconnecting inside the window and re-listening an account **disarms
-its pending sweep** — the runner reclaimed it. An account already
-armed when the operator unbinds keeps its standing deadline.
-
-Orders a strategy places over REST while its account's sweep is armed
-are **included** in the sweep when it fires — REST activity never
-counts as liveness.
-
-## The failure drill, end to end
-
-1. Runner holds one operator session (window, say, 10 000 ms) and has
-   listened accounts A, B, C. Strategies trade over REST.
-2. The runner process dies. The operator socket drops.
-3. The venue arms one deadline per listened account. The window is a
+1. The runner beats accounts A, B, C on a 30 s window and trades over
+   REST.
+2. The runner process dies. Beats stop; nothing else changes — no
+   socket teardown is involved in protection.
+3. Each account's deadline lapses where it stood. The window is a
    floor — never early.
-4. **Recovery path:** the runner restarts within 10 s, re-auths, and
-   re-listens A, B, C. Each admitted listen disarms that account's
-   sweep. Resting orders survived; the runner reconciles from its
-   snapshot bracket.
-5. **Death path:** no reclaim. At the first venue heartbeat at or
-   past each deadline, A, B, and C are each swept — every resting
-   order across all three accounts comes back as `cancel_done` with
-   `cause: "session_lost"`, and collateral unlocks.
+4. **Recovery path:** the runner restarts inside the window and beats
+   A, B, C again. The beat re-anchors each deadline; resting orders
+   survived. Reconcile each account from its snapshot, splice the
+   stream, resume.
+5. **Death path:** no beat arrives. At the venue's first tick at or
+   past each deadline, that account is swept: every resting order
+   comes back as `cancel_done` with `cause: "session_lost"` on the
+   account-events stream, and collateral unlocks on the confirmed
+   remaining. The fire consumes the arm — a later restart finds the
+   accounts unprotected and re-arms with its first beat.
 
-A restarted **venue** (not runner) drops armed deadlines with the
-sessions themselves; protection resumes when the runner re-auths and
-re-listens — so a runner's reconnect loop should always re-listen its
-full set, unconditionally.
+A restarted **venue** keeps every arm (arming is durable) but grants
+one fresh window from boot before any sweep can fire — a runner that
+keeps beating through a venue outage never notices; one that died with
+the venue is swept one window after boot.
 
-## Alternative: one client session per account
+## Alternative: no deadman
 
-Without operator scope, the same protection exists per account: each
-account's own WS session with a nonzero window arms when that
-account's **last** session closes. It works, but it is N sockets, N
-liveness domains, and N reconnect loops — the redundancy the operator
-plane exists to remove. Prefer it only for a single-strategy runner.
-
-## Verified live
-
-Every behavioral claim above is pinned by an end-to-end probe against
-the deployed one-box exchange: one operator session listening six
-accounts; its death swept every last-watcher account's book inside
-the window, while a live client session, a second operator's listen,
-an explicit unlisten, and a reconnect-plus-re-listen each kept their
-account's orders exactly as described.
+Protection is opt-in per account. A strategy that prefers its resting
+orders to survive its own crashes simply never arms — orders then rest
+until filled, cancelled, expired, or the market closes. There is no
+per-connection protection to fall back to; the deadman is the whole
+story.

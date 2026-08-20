@@ -1,0 +1,126 @@
+---
+title: "Account events WebSocket"
+description: "The authed live event stream on account-edge: auth-first connect, event_seq gap detection, and operator multiplexing."
+icon: "lock"
+---
+
+`GET /v1/ws` on the **account-edge host** upgrades into the authenticated
+account-events stream. Account-edge is a delivery tier, cloned to scale: it
+verifies the same tokens the gateway does, holds no venue state, and serves
+exactly one thing — each account's live event frames, in order, each stamped
+with the account's dense `event_seq`.
+
+<Warning>
+The trading hosts serve no WebSocket — `GET /v1/ws` on a gateway or shell
+front answers `404`. Point event consumers at the account-edge address from
+your deploy configuration.
+</Warning>
+
+## Connection sequence
+
+<Steps>
+  <Step title="Upgrade">
+    Send an RFC 6455 upgrade to `/v1/ws` on the account-edge host. Query
+    strings and alternate paths are not accepted.
+  </Step>
+  <Step title="Authenticate first">
+    The first text message must be the canonical v9 `auth` frame — the JSON
+    itself, not the hex-encoded `Tiny-v1` header value.
+  </Step>
+  <Step title="Wait for auth_ok">
+    `auth_ok` echoes the numeric token account. No baseline follows: the
+    delivery tier restates no state.
+  </Step>
+  <Step title="Snapshot over REST, then splice">
+    Buffer the stream, fetch `GET /v1/orders` on the trading surface, and
+    apply buffered frames strictly above the snapshot's `event_seq` anchor.
+  </Step>
+</Steps>
+
+A client-scope session is subscribed to its own account at open — no verb
+needed. Events flow from then on, one canonical frame per text frame.
+
+## The event_seq contract
+
+Every delivered frame carries `event_seq` in its envelope: dense per account,
+starting at `"1"`, stamped by the gateway before delivery.
+
+- **A gap means missed delivery.** Delivery is best-effort by contract — the
+  tier may drop a frame or doom a slow session rather than buffer without
+  bound. The dense sequence makes every hole client-visible.
+- **Recovery is snapshot-then-splice**: `GET /v1/orders` answers the
+  `event_seq` anchor its rows already reflect; resume strictly above it.
+- **Deep replay** is the history plane: `GET /v1/history/account-events`
+  serves the stored frames after any cursor, verbatim — the same envelope
+  this stream delivers.
+- The sequence is process-local to the gateway: a venue restart re-bases it.
+  A regression means re-snapshot.
+
+## Event vocabulary
+
+| Type | Meaning |
+| --- | --- |
+| `order_accepted` | Engine accepted the order; precedes that order's fills |
+| `order_rejected` | An asynchronous refusal; inspect its sentinel-disciplined identity |
+| `fill` | One execution with absolute remaining quantity, positions, liquidity, and fee |
+| `cancel_done` | Terminal release with cause `requested`, `ioc_residual`, `gtd_expired`, `self_trade`, or `session_lost` |
+| `modify_done` | Price modification applied; the order remains live |
+| `order_expired` | Market-close sweep terminated the order |
+| `balance` | Absolute three-bucket balance; highest `balance_seq` wins |
+| `market_state` | Lifecycle card for a market the account holds a position in |
+| `fill_settled` | One fill reached chain finality; decomposes the promoted amount |
+| `market_settled` | Final market payout receipt |
+
+Application rules (dedup keys, absolute values, ordering) are in
+[Events and recovery](/events-and-recovery).
+
+## Operator multiplexing
+
+Operator-scope sessions hear nothing at connect and subscribe explicitly:
+
+```json
+{"version":9,"type":"listen","body":{"accounts":["000000000000000000000000000000000000002a","0000000000000000000000000000000000000063"]}}
+```
+
+- `listen` and `unlisten` each name 1–10 distinct canonical addresses, judged
+  independently in frame order — one refused account never voids the others.
+  An empty, over-cap, or duplicate-carrying list refuses the frame shape as
+  `bad_request` `bad_account_batch`.
+- An admitted listen answers an **empty confirmation bracket**:
+  `snapshot_begin`, then `snapshot_end` naming the account with every count
+  `0` and `event_seq` `"0"`. The delivery tier restates no state and knows no
+  anchor — reconcile each account against the gateway's snapshot, exactly as
+  a client session would.
+- A refused account answers its own `listen_rejected`: `unknown_account` (the
+  address is not the canonical embedded form, so no event could ever route to
+  it) or `subscription_capacity` (the account's subscriber row is full — a
+  fixed number of sessions may watch one account at a time).
+- `unlisten` answers `unlisten_done`, also for a never-listened account — the
+  goal state holds. Unlistening never touches the heartbeat deadman.
+- Subscriptions are session state: a reconnect starts from zero and
+  re-listens.
+- `listen` on a client-scope session answers `bad_request` `not_operator`.
+
+## What this socket refuses
+
+Trading vocabulary has no meaning here. A session that sends `new_order`,
+`cancel_order`, `cancel_all`, `modify_order`, or `heartbeat` frames is a
+misdirected client and is **doomed** — the connection closes rather than
+half-serving a session pointed at the wrong endpoint. Commands are REST, on
+the trading surface; order protection is `POST /v1/heartbeat`, not this
+socket's liveness.
+
+## Liveness and close behavior
+
+| Condition | Result |
+| --- | --- |
+| Normal peer or server shutdown | Close `1000` |
+| Token expires | Close `1008`; reconnect with a fresh token |
+| Liveness probes go unanswered | Close `1001` |
+| Egress backpressure (slow consumer) | Close `1013`; back off, reconnect, snapshot, splice |
+| Client payload exceeds the 587-byte frame cap | Close `1002` |
+| Trading vocabulary sent here | Connection doomed |
+
+The server pings a quiet session and closes after unanswered probes. Drain
+continuously, respond to pings, and treat every close as a
+snapshot-then-splice recovery event.

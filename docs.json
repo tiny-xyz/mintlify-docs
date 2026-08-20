@@ -8,6 +8,12 @@
     "light": "#2DD4BF",
     "dark": "#0F766E"
   },
+  "redirects": [
+    {
+      "source": "/websocket-trading",
+      "destination": "/rest-trading"
+    }
+  ],
   "navigation": {
     "tabs": [
       {
@@ -23,7 +29,8 @@
           {
             "group": "Trading integration",
             "pages": [
-              "websocket-trading",
+              "rest-trading",
+              "account-events",
               "multi-strategy",
               "operator-provisioning",
               "websocket-market-data",
@@ -35,7 +42,7 @@
       },
       {
         "tab": "API reference",
-        "openapi": "api/external/openapi-trading-v8-draft.yaml",
+        "openapi": "api/external/openapi-trading-v9-draft.yaml",
         "groups": [
           {
             "group": "Overview",
@@ -47,14 +54,16 @@
             "group": "Orders",
             "pages": [
               "POST /v1/orders",
-              "GET /v1/orders",
-              "POST /v1/modify",
               "POST /v1/cancel",
-              "POST /v1/cancel-all"
+              "GET /v1/orders",
+              "GET /v1/orders/{account}",
+              "POST /v1/modify",
+              "POST /v1/cancel-all",
+              "POST /v1/heartbeat"
             ]
           },
           {
-            "group": "Private streaming and health",
+            "group": "Account events and health",
             "pages": [
               "GET /v1/ws",
               "GET /v1/status"
@@ -65,6 +74,16 @@
             "openapi": "api/external/openapi-edge-stream-v1.yaml",
             "pages": [
               "GET /v1/stream"
+            ]
+          },
+          {
+            "group": "History replay",
+            "openapi": "api/external/openapi-history-rest-v1.yaml",
+            "pages": [
+              "GET /v1/history/deltas",
+              "GET /v1/history/keyframe",
+              "GET /v1/history/account-events",
+              "GET /health"
             ]
           }
         ]

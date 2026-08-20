@@ -1,0 +1,126 @@
+---
+title: "REST trading and the heartbeat deadman"
+description: "Commands, acknowledgements, snapshots, and per-account order protection on the v9 REST surface."
+icon: "bolt"
+---
+
+All trading is REST. Each command is one HTTP `POST` whose body is a single
+canonical frame, authenticated by the `Tiny-v1` header on that request. There
+is no trading WebSocket and no trading session: identity, scope, and policy
+ride each request.
+
+## Command doors
+
+Each route accepts exactly one frame type; any other type answers
+`bad_request` with reason `bad_type`.
+
+| Route | Frame type | Acknowledgement |
+| --- | --- | --- |
+| `POST /v1/orders` | `new_order` | `202` with an `order_submitted` body carrying the exchange `order_id` |
+| `POST /v1/cancel` | `cancel_order` | Bodyless `202` after durable publication |
+| `POST /v1/cancel-all` | `cancel_all` | Bodyless `202` after every expanded cancel durably published |
+| `POST /v1/modify` | `modify_order` | Bodyless `202` after durable publication |
+| `POST /v1/heartbeat` | `heartbeat` | Bodyless `202`: the whole batch armed, re-anchored, or disarmed |
+
+Every `202` means durably accepted, never executed: engine verdicts
+(`order_accepted`, fills, `cancel_done`, `modify_done`, asynchronous
+`order_rejected`) arrive on
+[the account events WebSocket](/account-events) or in the next snapshot.
+
+Refusals map to status codes: `422` carries an `order_rejected` frame, `400` a
+`bad_request` frame, `401` an `auth_failed` frame, and `429` a rate refusal
+with a `Retry-After` header. `503` means ingress is saturated (not admitted —
+retry). `504` means the response rendezvous timed out and the command may have
+executed: retry new orders as the same bytes, cancels and heartbeats freely,
+modifies with the same `modify_seq`.
+
+## Request mechanics
+
+- Send a `Content-Length`; chunked transfer is refused. Bodies over 587 bytes
+  answer `413` before parsing.
+- The token is re-verified per request, including once more after the body
+  arrives — a token can expire between requests on one keep-alive connection.
+- Rate limits charge the token's account (30 requests per second per account
+  by default) plus a per-connection limiter.
+- `GET` on a command route answers `405`.
+
+## Snapshots
+
+`GET /v1/orders` returns the token account's complete state as NDJSON, one
+canonical frame per line: `snapshot_begin`, one `market_state` per live
+market, one `snapshot_order` per open order, one `snapshot_position` per
+market holding lots, `snapshot_balance`, and `snapshot_end` with integrity
+counts — verify them.
+
+`snapshot_end` also carries the account's `event_seq` anchor: every
+account-events frame at or below it is already reflected in the snapshot, so
+resume a buffered stream strictly above it. This anchor is the one recovery
+coordinate in the system — snapshot first, then splice.
+
+`GET /v1/orders/{account}` (the exact canonical 40-hex address) is the
+operator cross-account form. Client tokens see `404`, never `403`: the
+refusal must not confirm an account exists.
+
+`GET /v1/status` answers a `venue_status` frame with no token and no rate
+charge. An answering front has a live command path; absence of an answer is
+the degraded signal.
+
+## The heartbeat deadman
+
+`POST /v1/heartbeat` is the only order-protection mechanism: transport
+disconnects arm nothing and fire nothing. A beat names 1–10 accounts and one
+`window_ms`:
+
+```json
+{"version":9,"type":"heartbeat","body":{"salt":"7","accounts":["000000000000000000000000000000000000002a"],"window_ms":30000}}
+```
+
+- **Arm / re-anchor** — a nonzero window (`3000..=600000` ms) sets each named
+  account's deadline to now + window. While armed, the venue sweeps the
+  account the moment a window elapses with no further beat naming it: every
+  resting order terminates with `cancel_done` cause `session_lost`, and funds
+  unlock on the confirmed remaining.
+- **Disarm** — `window_ms` `0`. Disarming an unarmed account is an idempotent
+  `202`.
+- **All or nothing** — the batch is judged whole: every named account arms or
+  none does. A client token must name exactly its own account (anything else
+  rejects `wrong_account`); an operator token names any ledger-known accounts
+  (an unknown one rejects `unknown_account`). The reject echoes your `salt`,
+  the first refused account, and the all-zero `market_id`.
+- **One window per frame** — different windows for different accounts means
+  pipelining frames.
+
+### Sweep semantics
+
+- The window is a floor: the venue fires no earlier than the deadline, at its
+  next internal tick at or past it.
+- A sweep is a venue-authored cancel-all: each swept order answers its
+  ordinary terminal `cancel_done` with cause `session_lost`. Your own cancel
+  crossing the sweep in flight still answers `requested` — you did ask.
+- A fire consumes the arm. After a sweep, the account is unprotected until
+  your next beat re-arms it — a recovering runner's first action is a fresh
+  beat.
+- An account with nothing resting still arms and still fires; the lapse just
+  sweeps nothing. Orders placed while armed are covered by the standing
+  deadline — REST trading activity never counts as liveness. Only beats do.
+
+### Restart behavior
+
+Arming is durable: a window change survives a gateway restart. Deadlines are
+not — on boot the venue re-anchors every armed account at boot time plus its
+window, so an outage grants one full window to resume beating and never
+sweeps at time zero.
+
+### Choosing a window and cadence
+
+Beat at a third to half the window, and size the window to absorb your retry
+budget plus network jitter: a 30 s window with a 10 s beat cadence survives
+two lost beats. Sub-jitter windows are refused at decode
+(`bad_heartbeat_window` below 3 s), and windows above 10 minutes answer
+nothing a deadman can mean.
+
+<Warning>
+Do not arm a short window and then submit orders from a process that cannot
+keep beating. The sweep cancels every resting order of the account — that is
+its purpose.
+</Warning>

@@ -1,0 +1,151 @@
+# Tiny history REST — tiny-history query plane (OpenAPI 3.1).
+#
+# The read side's replay and anchor surface: stored feed rows,
+# keyframes, and authed account-event replay off the history service's
+# postgres store. The edge WS stream (openapi-edge-stream-v1.yaml)
+# splices against these anchors on (epoch, update_seq); account
+# consumers reconcile on (incarnation, event_seq). Authoritative prose
+# contract: docs/context/api.md ("History REST API"); the service and
+# schema internals are docs/context/history.md.
+#
+# Conventions shared with the other Tiny surfaces: strict JSON, u64s
+# as quoted decimal strings, bare numbers only for values provably <=
+# u32, floats never, snake_case. Row bodies reuse the edge stream's
+# delta vocabulary field-for-field, so one parser handles live WS
+# deltas and stored rows.
+
+openapi: 3.1.0
+info:
+  title: Tiny history REST
+  version: "1.0"
+  description: >
+    GET-only, one request per connection (Connection: close). Rows
+    appear on the store's batched flush cadence (~5 s): this plane
+    serves reconcile and replay, never the live tail — the edge and
+    account-edge tiers own delivery. Public rows serve the LATEST
+    stored feed epoch; account events serve the CURRENT gateway
+    incarnation (the store's monotone counter over per-account
+    event_seq chain restarts).
+
+servers:
+  - url: https://history.tiny-testing.xyz
+    description: History box origin (host per deploy).
+
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Liveness
+      responses:
+        "200":
+          description: '{"status":"ok"} — the process answers.'
+
+  /v1/history/deltas:
+    get:
+      operationId: deltas
+      summary: Public feed rows after a coordinate
+      parameters:
+        - name: market
+          in: query
+          required: true
+          schema: { type: string, pattern: "^[1-9][0-9]{0,9}$" }
+          description: Canonical decimal market id (no leading zeros, fits u32, not 0).
+        - name: after
+          in: query
+          required: false
+          schema: { type: string, pattern: "^(0|[1-9][0-9]{0,19})$" }
+          description: update_seq cursor; rows strictly above it. Default 0.
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+          description: Page size; default 100, values clamp into 1..=1000.
+      responses:
+        "200":
+          description: >
+            {"epoch":"E","events":[row,...]} — latest stored epoch
+            only, rows ascending by update_seq. Each row is
+            {"update_seq":"N","market_id":"M","kind":...} in the edge
+            delta vocabulary (book/trade/stats/lifecycle plus the
+            keyframe_begin/keyframe_end brackets). Page by passing the
+            last row's update_seq as after.
+        "400":
+          description: Missing or non-canonical market/after/limit.
+        "503":
+          description: store_unavailable — retry.
+
+  /v1/history/keyframe:
+    get:
+      operationId: keyframe
+      summary: The newest stored keyframe of one market
+      parameters:
+        - name: market
+          in: query
+          required: true
+          schema: { type: string, pattern: "^[1-9][0-9]{0,9}$" }
+      responses:
+        "200":
+          description: >
+            {"epoch":"E","keyframe":{"market_id":"M","update_seq":"N",
+            "levels":[{"side":"bid|ask","price":T,"qty":"Q",
+            "orders":O},...],"trades":[trade,...]}} — the state anchor
+            at coordinate N in the latest epoch; splice deltas with
+            update_seq > N above it.
+        "400":
+          description: Missing or non-canonical market.
+        "404":
+          description: >
+            no_keyframe — none stored yet for this market/epoch; fall
+            back to deltas from 0 or wait one sweep cadence.
+        "503":
+          description: store_unavailable — retry.
+
+  /v1/history/account-events:
+    get:
+      operationId: account_events
+      summary: One account's stored event frames after a coordinate
+      description: >
+        Token-authed with the gateway's exact REST scheme:
+        "Authorization: Tiny-v1 <hex auth frame>", verified against
+        the same deployed key files. A client-scope token reads its
+        own account; account= is the operator vocabulary — refused
+        403 for client scope, and an operator omitting it reads the
+        token's own account.
+      parameters:
+        - name: Authorization
+          in: header
+          required: true
+          schema: { type: string, pattern: "^Tiny-v1 [0-9a-f]+$" }
+        - name: after
+          in: query
+          required: false
+          schema: { type: string, pattern: "^(0|[1-9][0-9]{0,19})$" }
+          description: event_seq cursor; rows strictly above it. Default 0.
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+        - name: account
+          in: query
+          required: false
+          schema: { type: string, pattern: "^[1-9][0-9]{0,19}$" }
+          description: Operator only — the account to read.
+      responses:
+        "200":
+          description: >
+            {"incarnation":"I","events":[frame,...]} — the account's
+            stored frames with event_seq > after, ascending. Each
+            frame is the VERBATIM sequenced WS frame the gateway
+            published ({"version":9,"type":...,"ts_ms":"...",
+            "event_seq":"n","body":{...}}), so account-events client code
+            parses rows unchanged. A changed incarnation between reads
+            means earlier coordinates no longer compare — restart
+            pagination from 0.
+        "400":
+          description: Non-canonical after/limit/account.
+        "401":
+          description: unauthenticated (no credential) / auth_failed (forged, malformed, or expired token — undistinguished on purpose).
+        "403":
+          description: operator_only — a client-scope token passed account=.
+        "503":
+          description: store_unavailable — retry.
