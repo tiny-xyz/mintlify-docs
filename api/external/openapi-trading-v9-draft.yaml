@@ -405,28 +405,15 @@ components:
       in: header
       name: Authorization
       description: >
-        "Tiny-v1 <hex>" where <hex> is the hex encoding of the full
-        canonical auth frame:
-        {"version":9,"type":"auth","body":{"account":"<u64>","expires_at":"<wall-ns>","key_id":<u16>,"sig":"<128 hex>"}}
-        sig = HMAC-SHA512 over "tiny-auth-v1:<account>:<expires_at>:<key_id>"
-        under the key file secret named by key_id. Mint tokens with
-        tiny-gateway-keytool. Per-request; no cookies or server
-        sessions. The same frame, sent as JSON (not hex), is the
-        first text message of the account-events WebSocket (see
-        /v1/ws). The token remains the account authority; the
-        per-order sig field is carried for the settlement-ready
-        shape, not yet verified.
-        Which key store resolves key_id decides the request's scope:
-        the client store (one token, one account — deployed to every
-        front) or the venue-deployed operator store (cross-account
-        trading, snapshots, and heartbeats over REST, plus the
-        listen/unlisten vocabulary on the events WS) — nothing inside
-        the token chooses. The operator store is deployed only to the
-        gateway core and the account-edge tier: an operator token
-        presented to a shell front fails auth_failed unknown_key.
-        The auth body carries NO order-protection policy — protection
-        is the POST /v1/heartbeat deadman, per account, not session
-        state.
+        "Tiny-v1 <hex>" — the hex-encoded canonical auth frame
+        {"version":9,"type":"auth","body":{"account":"<u64>","expires_at":"<wall-ns>","key_id":<u16>,"sig":"<128 hex>"}},
+        with sig = HMAC-SHA512 over
+        "tiny-auth-v1:<account>:<expires_at>:<key_id>". Mint with
+        tiny-gateway-keytool; verified per request, no sessions. The
+        key store resolving key_id sets the scope — client (one
+        account) or operator (cross-account; resolvable only at the
+        gateway core and account-edge). The same frame, as JSON,
+        opens the account-events WebSocket.
 
   responses:
     Rejected:
@@ -1098,11 +1085,9 @@ components:
       type: object
       description: >-
         The accepted events-WS auth's answer. No baseline follows —
-        the delivery tier holds no state; snapshot via REST and
-        splice on event_seq. account is the token's u64 account id as
-        a quoted decimal — the one frame that speaks the id rather
-        than the 40-hex address (the token names the id; the address
-        embedding is the client's own construction).
+        snapshot via REST and splice on event_seq. account is the
+        token's u64 account id as a quoted decimal, the one frame
+        that speaks the id rather than the 40-hex address.
       properties:
         version: { const: 9 }
         type: { const: auth_ok }
@@ -1115,13 +1100,11 @@ components:
     AuthFailedFrame:
       type: object
       description: >-
-        Authentication refused (401 body on REST; on the events WS
-        the socket closes after it). Deliberately echoes no account:
-        an unauthenticated caller is owed nothing it did not already
-        know, least of all confirmation that an account exists.
-        sanctioned is a retained word, not emitted at auth — a
-        sanctioned account passes auth and is refused at admission
-        instead (order_rejected sanctioned).
+        Authentication refused (401 body on REST; the events WS
+        closes after it). Deliberately echoes no account. sanctioned
+        is retained, not emitted at auth — a sanctioned account
+        passes auth and is refused at admission (order_rejected
+        sanctioned).
       properties:
         version: { const: 9 }
         type: { const: auth_failed }
