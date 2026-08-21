@@ -66,7 +66,7 @@ The subscription acknowledgement and splice anchor:
 | --- | --- |
 | `market_id` | The answered market — the pinned id or the venue default; `null` before the feed has named any market |
 | `epoch`, `update_seq` | The stream coordinate the stream is current through — splice history at or below it |
-| `state` | The market's lifecycle card as this edge knows it; gate order entry on `open` |
+| `state` | `"created"`, `"open"`, `"closed"`, `"settled"`, or `null` for an unannounced market; gate order entry on `open` |
 | `suspect` | The producer's caution flag: this market's mirror may have missed unrecoverable updates |
 | `tick_step` | The market's price-grid step, or `null` until learned |
 | `stale` | Whether served prices are currently flagged not-live |

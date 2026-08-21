@@ -57,34 +57,6 @@ The complete client vocabulary on this socket is three frames. Everything else i
 
 A client-scope session has nothing to send after `auth`. Silence is the conforming behavior; the server's pings need only the standard automatic pongs.
 
-### Auth refusals
-
-- A first data frame that is not the `auth` frame answers `bad_request` `unauthenticated` and the connection ends. A control frame before auth ends the connection — a conforming client authenticates before anything else.
-- A token that decodes but fails verification answers `auth_failed` with `bad_token`, `expired_token`, or `unknown_key`, then the connection ends. `sanctioned` is a retained word, not emitted at auth — a sanctioned account passes auth and is refused at trading admission, on the REST surface.
-- The auth-first window rides the whole-request deadline: a peer that upgrades and then withholds its auth frame holds a connection, never a session slot — and not forever.
-- Re-auth on an open session answers `bad_request` `bad_type` — the session is its token's; reconnect to rotate.
-
-## What a session may send
-
-The complete client vocabulary on this socket is three frames. Everything else is refused:
-
-| Frame | Scope | Answer |
-| --- | --- | --- |
-| `auth` (first text frame) | Both | `auth_ok`, or `auth_failed` and the connection ends |
-| `listen` | Operator | Per account: the empty confirmation bracket, or `listen_rejected` |
-| `unlisten` | Operator | Per account: `unlisten_done` |
-
-| Refused input | Answer |
-| --- | --- |
-| `listen` / `unlisten` on a client-scope session | `bad_request` `not_operator`; the socket stays open |
-| A second `auth` | `bad_request` `bad_type`; the socket stays open |
-| A frame that fails the canonical grammar | `bad_request` with the grammar reason; the socket stays open |
-| A frame over the per-account rate limit | `bad_request` `rate_limited`; the socket stays open |
-| Trading vocabulary (`new_order`, `cancel_order`, `cancel_all`, `modify_order`, `heartbeat`) | Session doomed; close `1013` |
-| A payload over the 587-byte frame cap, unmasked data, or broken framing | Close `1002` |
-
-A client-scope session has nothing to send after `auth`. Silence is the conforming behavior; the server's pings need only the standard automatic pongs.
-
 ## The event\_seq contract
 
 Every delivered frame carries `event_seq` in its envelope: dense per account, starting at `"1"`, stamped by the gateway before delivery.
