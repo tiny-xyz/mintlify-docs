@@ -54,44 +54,249 @@ One connection may hold up to eight explicit market pins in addition to the defa
 - Client control messages are rate-limited, default 16 per second; over the limit closes `1013`.
 - Pongs draw their own higher allowance instead of that window — four times the control rate with a floor of 64 per second — so RFC 6455-legal unsolicited-pong keepalives and post-suspend pong bursts neither close a healthy socket nor crowd a re-sub out of the shared window. Only a genuine pong flood past that budget closes `1013`.
 
-## Server-to-client messages
+## Server message reference
 
-Every application frame is an unfragmented text message, one JSON object, one of exactly four types — `sub_ok`, `delta`, `stale`, `live` — carrying `type`, `seq` (the gapless connection-wide quoted `u64` from `"1"`), `epoch`, and `update_seq`. `epoch` and `update_seq` are `null` only before this edge has seen any feed frame.
+Every application frame is an unfragmented text message, one flat JSON object, one of exactly four types. On the wire the object carries fixed key order and no whitespace; the examples below add whitespace for readability only — the field order shown is the wire order.
+
+| Type | You receive it when |
+| --- | --- |
+| [`sub_ok`](#sub_ok) | A `sub` was accepted — the splice anchor, also answering every re-sub |
+| [`delta` kind `book`](#delta-kind-book) | A price level's absolute state changed |
+| [`delta` kind `trade`](#delta-kind-trade) | A trade printed |
+| [`delta` kind `stats`](#delta-kind-stats) | The market's rolling statistics were restated |
+| [`delta` kind `lifecycle`](#delta-kind-lifecycle) | A market's lifecycle card was published or restated |
+| [`delta` kind `keyframe_begin`](#delta-kind-keyframe_begin) | The producer opened a full-restatement sweep for a market |
+| [`delta` kind `keyframe_end`](#delta-kind-keyframe_end) | That sweep closed — the ghost-healing point |
+| [`stale`](#stale) | Served prices stopped being provably live |
+| [`live`](#live) | A complete keyframe sweep re-proved the stream |
+
+All four types carry the same three stream fields (each example shows its type's exact key order — `sub_ok` places `market_id` between `seq` and `epoch`; `delta` places it after `update_seq`):
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `seq` | quoted `u64` | The connection's one gapless delivery sequence from `"1"`, shared across every subscription; a gap means loss — re-sub and re-splice |
+| `epoch` | quoted `u32`, or `null` | The feed producer's incarnation — the namespace `update_seq` lives in; never compare coordinates across epochs. `null` only before this edge has seen any feed frame |
+| `update_seq` | quoted `u64`, or `null` | The venue-authored update coordinate, identical across every edge box and the history rows. On a `delta` it is the emitting update's own; on `sub_ok`/`stale`/`live` the newest coordinate the stream has carried. `null` only alongside a `null` epoch |
 
 ### sub\_ok
 
-The subscription acknowledgement and splice anchor:
+You receive it once per accepted `sub` — the subscription acknowledgement and splice anchor; a re-sub answers a fresh one on the same `seq` chain. It carries no book and no tape.
 
-| Field | Meaning |
-| --- | --- |
-| `market_id` | The answered market — the pinned id or the venue default; `null` before the feed has named any market |
-| `epoch`, `update_seq` | The stream coordinate the stream is current through — splice history at or below it |
-| `state` | `"created"`, `"open"`, `"closed"`, `"settled"`, or `null` for an unannounced market; gate order entry on `open` |
-| `suspect` | The producer's caution flag: this market's mirror may have missed unrecoverable updates |
-| `tick_step` | The market's price-grid step, or `null` until learned |
-| `stale` | Whether served prices are currently flagged not-live |
-| `now_ms` | Server wall clock at answer time, for client skew estimation |
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `market_id` | quoted decimal, or `null` | The answered market — the pinned id or the venue default; `null` before the feed has named any market |
+| `state` | word, or `null` | `"created"`, `"open"`, `"closed"`, or `"settled"` — the lifecycle card as this edge knows it; `null` for an unannounced market. Gate order entry on `"open"` |
+| `suspect` | bool | The producer's caution flag: this market's mirror may have missed unrecoverable updates — render with the same caution as stale |
+| `tick_step` | bare int, or `null` | The market's price-grid step in 0.1¢ ticks (a divisor of 1000; `1` = full grid), or `null` until learned |
+| `stale` | bool | Whether served prices are currently flagged not-live — the in-band form of the `stale` frame for late subscribers |
+| `now_ms` | quoted `u64` | Server wall clock at answer time, milliseconds — skew estimation only |
 
-### Delta kinds
+```json
+{
+  "type": "sub_ok",
+  "seq": "1",
+  "market_id": "7",
+  "epoch": "3",
+  "update_seq": "48210",
+  "state": "open",
+  "suspect": false,
+  "tick_step": 5,
+  "stale": false,
+  "now_ms": "1787147712432"
+}
+```
 
-`type: "delta"` is discriminated by `kind`; every delta carries its own `market_id` — always key state by it.
+### delta
 
-| Kind | Payload and application |
-| --- | --- |
-| `book` | `side` (`"bid"`/`"ask"`), `price`, `qty`, `orders`; overwrite the level's absolute state, deleting it when `qty` is `"0"` |
-| `trade` | `book_seq`, `fill_index`, `price`, `qty`, `taker_side` (`"buy"`/`"sell"` of YES), `ts_ms` (`"0"` = no stamp; display only); deduplicate by `(book_seq, fill_index)` — keyframe sweeps restate recent prints, and `book_seq` orders trades |
-| `stats` | Replace the entire `stats` object: `volume_tenths`, `open_interest`, `total_trades`, `unique_traders`, `last_price` (`null` before the first trade) |
-| `lifecycle` | Apply absolutely: `state`, `suspect`, `settled_outcome` (`"yes_won"`/`"no_won"`/`"void"`/`"settled_at_price"` or `null`), `settle_price` (non-null only for `settled_at_price`), `opened_at_ms`, `closes_at_ms` (advisory window stamps), `tick_step`; a `null` value never erases a learned one — it means the producer did not know |
-| `keyframe_begin` | `keyframe_id`: the producer opened its periodic full-restatement sweep for this market |
-| `keyframe_end` | `keyframe_id` (pairs the bracket), `level_count`, `trade_count`: the bracket closed — heal ghosts here |
+You receive one per relayed feed update on a subscribed market — plus every venue-wide lifecycle card regardless of your subscription set. The only content-bearing type, discriminated by `kind`. After the stream fields every delta carries `market_id` (quoted decimal — the frame's own market; always key state by it) and `kind`, then the kind's fields.
 
-Lifecycle cards are venue-wide and can name a market other than any you serve — a predecessor's late settle beside the live successor. A mid-life grid refinement arrives as a same-state card carrying the finer `tick_step`.
+#### delta kind `book`
 
-**Keyframe brackets:** inside a bracket, the sweep's level and trade restatements arrive as ordinary `book`/`trade` deltas. At `keyframe_end`, a stateful client deletes any held level of that market no delta touched inside the bracket — its delete was lost upstream. Clients holding no book ignore the brackets.
+You receive it when a price level's state changes — and inside keyframe brackets, when the sweep restates a live level. Overwrite the level with the absolute values; never add.
 
-### stale and live
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `side` | word | `"bid"` or `"ask"` — the resting side |
+| `price` | bare int | The level's price in ticks, `1..=999` |
+| `qty` | quoted `u64` | Total resting lots at the level; `"0"` means the level is gone — delete it |
+| `orders` | bare int | Distinct resting orders at the level |
 
-`type: "stale"` means served prices are not live: the upstream feed gapped, went quiet, or restarted. It is stream-scoped — flag every market the connection renders. `type: "live"` clears the flag after a complete keyframe sweep re-proves the stream. A fresh subscriber learns the current flag from `sub_ok.stale`. Prices are flagged, never frozen.
+```json
+{
+  "type": "delta",
+  "seq": "2",
+  "epoch": "3",
+  "update_seq": "48211",
+  "market_id": "7",
+  "kind": "book",
+  "side": "bid",
+  "price": 350,
+  "qty": "40",
+  "orders": 3
+}
+```
+
+#### delta kind `trade`
+
+You receive it when a trade prints — and inside keyframe brackets, when the sweep restates a recent print. `(book_seq, fill_index)` is the unique identity: a stateful tape must deduplicate on the pair, and `book_seq` orders trades.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `book_seq` | quoted `u64` | The taker command's per-market sequence — half the dedup identity, and the trade ordering |
+| `fill_index` | bare int | Disambiguates the N fills one taker command produces under a single `book_seq`, from `0` |
+| `price` | bare int | Execution price in ticks (maker price, YES frame) |
+| `qty` | quoted `u64` | Lots traded |
+| `taker_side` | word | `"buy"` or `"sell"` — which way the aggressor traded YES |
+| `ts_ms` | quoted `u64` | Wall-clock print stamp, milliseconds; `"0"` = no stamp. Display only — never ordering |
+
+```json
+{
+  "type": "delta",
+  "seq": "3",
+  "epoch": "3",
+  "update_seq": "48212",
+  "market_id": "7",
+  "kind": "trade",
+  "book_seq": "10452",
+  "fill_index": 0,
+  "price": 340,
+  "qty": "2",
+  "taker_side": "buy",
+  "ts_ms": "1787147712501"
+}
+```
+
+#### delta kind `stats`
+
+You receive it when the market's rolling statistics are restated. Replace the held `stats` object whole.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `stats.volume_tenths` | quoted `u64` | Traded notional in tenths of a cent — multiply by 1,000 for the trading API's micro-dollar base units |
+| `stats.open_interest` | quoted `u64` | Open lots |
+| `stats.total_trades` | quoted `u64` | Lifetime print count |
+| `stats.unique_traders` | bare int | Distinct accounts that have traded |
+| `stats.last_price` | bare int, or `null` | Last trade price in ticks; `null` before the first trade |
+
+```json
+{
+  "type": "delta",
+  "seq": "4",
+  "epoch": "3",
+  "update_seq": "48213",
+  "market_id": "7",
+  "kind": "stats",
+  "stats": {
+    "volume_tenths": "81240",
+    "open_interest": "1250",
+    "total_trades": "362",
+    "unique_traders": 48,
+    "last_price": 340
+  }
+}
+```
+
+#### delta kind `lifecycle`
+
+You receive it when a market's card is published or restated — every card relays, restatements included, and reaches every subscriber regardless of its subscription set. Apply absolutely, keyed by `market_id`; a `null` value never erases a learned one — it means the producer did not know. Cards are venue-wide and can name a market other than any you serve — a predecessor's late settle beside the live successor. A mid-life grid refinement arrives as a same-state card carrying the finer `tick_step`.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `state` | word | `"created"`, `"open"`, `"closed"`, or `"settled"` |
+| `suspect` | bool | The producer's caution flag for this market's mirror |
+| `settled_outcome` | word, or `null` | `"yes_won"`, `"no_won"`, `"void"`, or `"settled_at_price"`; `null` while unresolved |
+| `settle_price` | bare int, or `null` | Final YES price in ticks; non-null only for `"settled_at_price"` |
+| `opened_at_ms` | quoted `u64`, or `null` | Advertised open stamp, milliseconds — advisory |
+| `closes_at_ms` | quoted `u64`, or `null` | Advertised close stamp, milliseconds — advisory; the venue's sequenced close is the authority |
+| `tick_step` | bare int, or `null` | The market's price-grid step, or `null` when unknown |
+
+```json
+{
+  "type": "delta",
+  "seq": "5",
+  "epoch": "3",
+  "update_seq": "48214",
+  "market_id": "7",
+  "kind": "lifecycle",
+  "state": "open",
+  "suspect": false,
+  "settled_outcome": null,
+  "settle_price": null,
+  "opened_at_ms": "1787144100000",
+  "closes_at_ms": "1787151600000",
+  "tick_step": 5
+}
+```
+
+#### delta kind `keyframe_begin`
+
+You receive it when the producer opens its periodic full-restatement sweep for this market. Between this and the matching `keyframe_end`, the sweep restates every live level and recent print as ordinary `book`/`trade` deltas — indistinguishable from live ones on purpose.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `keyframe_id` | quoted `u64` | Pairs this bracket with its `keyframe_end` |
+
+```json
+{
+  "type": "delta",
+  "seq": "6",
+  "epoch": "3",
+  "update_seq": "48215",
+  "market_id": "7",
+  "kind": "keyframe_begin",
+  "keyframe_id": "912"
+}
+```
+
+#### delta kind `keyframe_end`
+
+You receive it when the bracket closes — the ghost-healing point: a stateful client deletes any held level of this market no delta touched inside the bracket (its delete was lost upstream). Clients holding no book ignore the brackets.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `keyframe_id` | quoted `u64` | Pairs the bracket with its `keyframe_begin` |
+| `level_count` | bare int | Distinct levels the sweep restated |
+| `trade_count` | bare int | Prints the sweep restated |
+
+```json
+{
+  "type": "delta",
+  "seq": "38",
+  "epoch": "3",
+  "update_seq": "48279",
+  "market_id": "7",
+  "kind": "keyframe_end",
+  "keyframe_id": "912",
+  "level_count": 24,
+  "trade_count": 32
+}
+```
+
+### stale
+
+You receive it when served prices stop being provably live: the upstream feed gapped, went quiet, or restarted. Stream-scoped — flag every market the connection renders (the lost span could have carried any market's frames). Keep rendering, flagged, never frozen. It carries only the stream fields.
+
+```json
+{
+  "type": "stale",
+  "seq": "96",
+  "epoch": "3",
+  "update_seq": "48530"
+}
+```
+
+### live
+
+You receive it when a complete keyframe sweep re-proves the stream — clear the stale flag. A fresh subscriber learns the current flag from `sub_ok.stale` instead. It carries only the stream fields.
+
+```json
+{
+  "type": "live",
+  "seq": "180",
+  "epoch": "3",
+  "update_seq": "48770"
+}
+```
 
 ## Coordinates and recovery
 
