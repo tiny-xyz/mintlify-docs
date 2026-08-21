@@ -4,75 +4,365 @@ description: "The authed live event stream on account-edge: auth-first connect, 
 icon: "lock"
 ---
 
-`GET /v1/ws` on the **account-edge host** upgrades into the authenticated
-account-events stream. Account-edge is a delivery tier, cloned to scale: it
-verifies the same tokens the gateway does, holds no venue state, and serves
-exactly one thing — each account's live event frames, in order, each stamped
-with the account's dense `event_seq`.
+`GET /v1/ws` on the **account-edge host** upgrades into the authenticated account-events stream. Account-edge is a delivery tier, cloned to scale: it verifies the same tokens the gateway does, holds no venue state, and serves exactly one thing — each account's live event frames, in order, each stamped with the account's dense `event_seq`.
 
 <Warning>
-The trading hosts serve no WebSocket — `GET /v1/ws` on a gateway or shell
-front answers `404`. Point event consumers at the account-edge address from
-your deploy configuration.
+  The trading hosts serve no WebSocket — `GET /v1/ws` on a gateway or shell front answers `404`. Point event consumers at the account-edge address from your deploy configuration.
 </Warning>
 
 ## Connection sequence
 
 <Steps>
   <Step title="Upgrade">
-    Send an RFC 6455 upgrade to `/v1/ws` on the account-edge host. Query
-    strings and alternate paths are not accepted.
+    Send an RFC 6455 upgrade to `/v1/ws` on the account-edge host. Query strings and alternate paths are not accepted.
   </Step>
   <Step title="Authenticate first">
-    The first text message must be the canonical v9 `auth` frame — the JSON
-    itself, not the hex-encoded `Tiny-v1` header value.
+    The first text message must be the canonical v9 `auth` frame — the JSON itself, not the hex-encoded `Tiny-v1` header value.
   </Step>
   <Step title="Wait for auth_ok">
-    `auth_ok` echoes the numeric token account. No baseline follows: the
-    delivery tier restates no state.
+    `auth_ok` echoes the numeric token account. No baseline follows: the delivery tier restates no state.
   </Step>
   <Step title="Snapshot over REST, then splice">
-    Buffer the stream, fetch `GET /v1/orders` on the trading surface, and
-    apply buffered frames strictly above the snapshot's `event_seq` anchor.
+    Buffer the stream, fetch `GET /v1/orders` on the trading surface, and apply buffered frames strictly above the snapshot's `event_seq` anchor.
   </Step>
 </Steps>
 
-A client-scope session is subscribed to its own account at open — no verb
-needed. Events flow from then on, one canonical frame per text frame.
+A client-scope session is subscribed to its own account at open — no verb needed. Events flow from then on, one canonical frame per text frame.
 
-## The event_seq contract
+### Auth refusals
 
-Every delivered frame carries `event_seq` in its envelope: dense per account,
-starting at `"1"`, stamped by the gateway before delivery.
+- A first data frame that is not the `auth` frame answers `bad_request` `unauthenticated` and the connection ends. A control frame before auth ends the connection — a conforming client authenticates before anything else.
+- A token that decodes but fails verification answers `auth_failed` with `bad_token`, `expired_token`, or `unknown_key`, then the connection ends. `sanctioned` is a retained word, not emitted at auth — a sanctioned account passes auth and is refused at trading admission, on the REST surface.
+- The auth-first window rides the whole-request deadline: a peer that upgrades and then withholds its auth frame holds a connection, never a session slot — and not forever.
+- Re-auth on an open session answers `bad_request` `bad_type` — the session is its token's; reconnect to rotate.
 
-- **A gap means missed delivery.** Delivery is best-effort by contract — the
-  tier may drop a frame or doom a slow session rather than buffer without
-  bound. The dense sequence makes every hole client-visible.
-- **Recovery is snapshot-then-splice**: `GET /v1/orders` answers the
-  `event_seq` anchor its rows already reflect; resume strictly above it.
-- **Deep replay** is the history plane: `GET /v1/history/account-events`
-  serves the stored frames after any cursor, verbatim — the same envelope
-  this stream delivers.
-- The sequence is process-local to the gateway: a venue restart re-bases it.
-  A regression means re-snapshot.
+## What a session may send
 
-## Event vocabulary
+The complete client vocabulary on this socket is three frames. Everything else is refused:
 
-| Type | Meaning |
+| Frame | Scope | Answer |
+| --- | --- | --- |
+| `auth` (first text frame) | Both | `auth_ok`, or `auth_failed` and the connection ends |
+| `listen` | Operator | Per account: the empty confirmation bracket, or `listen_rejected` |
+| `unlisten` | Operator | Per account: `unlisten_done` |
+
+| Refused input | Answer |
 | --- | --- |
-| `order_accepted` | Engine accepted the order; precedes that order's fills |
-| `order_rejected` | An asynchronous refusal; inspect its sentinel-disciplined identity |
-| `fill` | One execution with absolute remaining quantity, positions, liquidity, and fee |
-| `cancel_done` | Terminal release with cause `requested`, `ioc_residual`, `gtd_expired`, `self_trade`, or `session_lost` |
-| `modify_done` | Price modification applied; the order remains live |
-| `order_expired` | Market-close sweep terminated the order |
-| `balance` | Absolute three-bucket balance; highest `balance_seq` wins |
-| `market_state` | Lifecycle card for a market the account holds a position in |
-| `fill_settled` | One fill reached chain finality; decomposes the promoted amount |
-| `market_settled` | Final market payout receipt |
+| `listen` / `unlisten` on a client-scope session | `bad_request` `not_operator`; the socket stays open |
+| A second `auth` | `bad_request` `bad_type`; the socket stays open |
+| A frame that fails the canonical grammar | `bad_request` with the grammar reason; the socket stays open |
+| A frame over the per-account rate limit | `bad_request` `rate_limited`; the socket stays open |
+| Trading vocabulary (`new_order`, `cancel_order`, `cancel_all`, `modify_order`, `heartbeat`) | Session doomed; close `1013` |
+| A payload over the 587-byte frame cap, unmasked data, or broken framing | Close `1002` |
 
-Application rules (dedup keys, absolute values, ordering) are in
-[Events and recovery](/events-and-recovery).
+A client-scope session has nothing to send after `auth`. Silence is the conforming behavior; the server's pings need only the standard automatic pongs.
+
+## The event\_seq contract
+
+Every delivered account event carries `event_seq` in its envelope: dense per account, starting at `"1"`, stamped by the gateway before delivery. Session and subscription answers (`auth_ok`, `auth_failed`, `bad_request`, the listen bracket, `listen_rejected`, `unlisten_done`) never carry it.
+
+- **A gap means missed delivery.** Delivery is best-effort by contract — the tier may drop a frame or doom a slow session rather than buffer without bound. The dense sequence makes every hole client-visible.
+- **Recovery is snapshot-then-splice**: `GET /v1/orders` answers the `event_seq` anchor its rows already reflect; resume strictly above it.
+- **Deep replay** is the history plane: `GET /v1/history/account-events` serves the stored frames after any cursor, verbatim — the same envelope this stream delivers.
+- The sequence is process-local to the gateway: a venue restart re-bases it. A regression means re-snapshot.
+
+## Server message reference
+
+Two families of server frames exist on this socket: session answers, which carry no envelope `event_seq`, and account events, which always do.
+
+| Type | `event_seq` | You receive it when |
+| --- | --- | --- |
+| [`auth_ok`](#auth_ok) | no | Your `auth` frame was accepted |
+| [`auth_failed`](#auth_failed) | no | Your `auth` frame was refused; the connection ends |
+| [`bad_request`](#bad_request) | no | A frame you sent was refused; the socket stays open |
+| [`snapshot_begin`](#snapshot_begin) | no | A `listen` was admitted — opens the empty confirmation bracket |
+| [`snapshot_end`](#snapshot_end) | no | The bracket closes — every count `0`, body `event_seq` `"0"` |
+| [`listen_rejected`](#listen_rejected) | no | One named account of a `listen` was refused |
+| [`unlisten_done`](#unlisten_done) | no | An `unlisten` applied for one named account |
+| [`order_accepted`](#order_accepted) | yes | The engine booked an order (or admitted it as a taker) |
+| [`order_rejected`](#order_rejected) | yes | A command was refused asynchronously |
+| [`fill`](#fill) | yes | One execution of an order |
+| [`cancel_done`](#cancel_done) | yes | An order left the book with remaining quantity released |
+| [`modify_done`](#modify_done) | yes | A price modification applied; the order remains live |
+| [`order_expired`](#order_expired) | yes | The market-close sweep terminated an order |
+| [`fill_settled`](#fill_settled) | yes | One fill's released money cleared chain finality |
+| [`market_settled`](#market_settled) | yes | A market's settlement finalized — the payout receipt |
+| [`market_state`](#market_state) | yes | A lifecycle card for a market the account holds a position in |
+| [`balance`](#balance) | yes | The account's balances were restated after money moved |
+
+Application rules (dedup keys, absolute values, ordering) are in [Events and recovery](/events-and-recovery).
+
+### The envelope
+
+Every server frame is `{"version":9,"type":T,"ts_ms":"…","body":{…}}`; account event frames carry `event_seq` as one extra quoted-`u64` key between `ts_ms` and `body`. `ts_ms` is the emission wall stamp in milliseconds (`"0"` = no stamp) — observability only, never ordering. Absence is `event_seq`'s only encoding of "no stamp": session frames omit the key entirely, and an envelope `event_seq` of `"0"` never appears (the `"0"` sentinel in [`snapshot_end`](#snapshot_end) is a body field, not the envelope key). On the wire the frame carries fixed key order and no whitespace; the examples below add whitespace for readability only — the field order shown is the wire order.
+
+Every account-addressed body opens with `account`, the canonical 40-hex address — identity rides the frame, not the socket, so an operator session multiplexing accounts stays unambiguous and a single-account client gets its own address echoed as a free cross-check. The exceptions: `market_state` is a venue fact carrying no `account` field (it reaches you because the account holds a position; its envelope still carries that account's `event_seq`), and `auth_ok` speaks the token's numeric account id instead.
+
+### auth\_ok
+
+You receive it once, answering an accepted `auth` frame — the session is live. No baseline follows: the delivery tier restates no state.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | quoted `u64` | The token's numeric account id — the one frame that speaks the id rather than the 40-hex address |
+
+```json
+{"version":9,"type":"auth_ok","ts_ms":"1787147712100","body":{"account":"42"}}
+```
+
+### auth\_failed
+
+You receive it when authentication is refused; the connection ends after it. It deliberately echoes no account — an unauthenticated caller is owed no confirmation that an account exists.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `reason` | word | `bad_token` (signature does not verify), `expired_token`, or `unknown_key`. `sanctioned` is a retained word, not emitted at auth — a sanctioned account passes auth and is refused at trading admission |
+
+```json
+{"version":9,"type":"auth_failed","ts_ms":"1787147712100","body":{"reason":"expired_token"}}
+```
+
+### bad\_request
+
+You receive it when a frame you sent was refused before it meant anything — a grammar violation, a transport cap, or a session-state refusal. It carries no identity (an unparseable frame has none); the socket stays open.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `reason` | word | On this socket: `not_operator` (a `listen`/`unlisten` from a client-scope session), `bad_type` (a second `auth`), `bad_account_batch` (an empty, over-cap, or duplicate-carrying accounts list), `rate_limited`, `unauthenticated` (a first frame that was not `auth`), `oversize_frame`, or a canonical-grammar word (`not_canonical`, `bad_number`, `bad_word`, `bad_hex`, …) |
+
+```json
+{"version":9,"type":"bad_request","ts_ms":"1787147713205","body":{"reason":"not_operator"}}
+```
+
+### snapshot\_begin
+
+You receive it when an operator `listen` is admitted for an account — it opens that account's empty confirmation bracket. The body is empty.
+
+```json
+{"version":9,"type":"snapshot_begin","ts_ms":"1787147713900","body":{}}
+```
+
+### snapshot\_end
+
+You receive it immediately after, closing the bracket. On this tier the bracket is always empty: the box holds no account state to restate and knows no anchor — reconcile against the gateway snapshot, whose `snapshot_end` names the real anchor.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | 40-hex | The listened account |
+| `orders` | bare int | Always `0` here — no `snapshot_order` lines exist on this tier |
+| `positions` | bare int | Always `0` |
+| `markets` | bare int | Always `0` |
+| `balances` | bare int | Always `0` |
+| `event_seq` | quoted `u64` | Always `"0"` — the no-anchor sentinel. This is a body field; the envelope carries no `event_seq` on this frame |
+
+```json
+{"version":9,"type":"snapshot_end","ts_ms":"1787147713900","body":{"account":"0000000000000000000000000000000000000063","orders":0,"positions":0,"markets":0,"balances":0,"event_seq":"0"}}
+```
+
+### listen\_rejected
+
+You receive it when one named account of a `listen` is refused; the other accounts in the batch are judged independently.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | 40-hex | The refused account, echoed verbatim |
+| `reason` | word | `unknown_account` (not the canonical embedded form — no event could ever route to it) or `subscription_capacity` (the account's subscriber row is full) |
+
+```json
+{"version":9,"type":"listen_rejected","ts_ms":"1787147713900","body":{"account":"00000000000000000000000000000000000000ff","reason":"unknown_account"}}
+```
+
+### unlisten\_done
+
+You receive it when an `unlisten` applies for one named account — also when the account was never listened (the goal state already holds). Frames already queued behind it may still drain.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | 40-hex | The unsubscribed account, echoed verbatim |
+
+```json
+{"version":9,"type":"unlisten_done","ts_ms":"1787147714600","body":{"account":"0000000000000000000000000000000000000063"}}
+```
+
+### order\_accepted
+
+You receive it when the engine books the order (or admits it as a taker). It always precedes that order's fills and echoes the original quantity — resting quantity is derived from fills, never carried.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | 40-hex | The order's account |
+| `salt` | quoted `u64` | Your correlation label echoed; `"0"` when the gateway lacks the mapping (pre-restart orders) |
+| `market_id` | 64-hex | The market key |
+| `book_seq` | quoted `u64` | The accepting command's per-market sequence |
+| `order_id` | quoted `u64` | The gateway-assigned exchange identity |
+| `side` | word | `"buy"` or `"sell"` of YES |
+| `price` | bare int | Limit price in ticks, `1..=999` |
+| `qty` | quoted `u64` | The original order quantity in lots |
+
+```json
+{"version":9,"type":"order_accepted","ts_ms":"1787147712501","event_seq":"7","body":{"account":"000000000000000000000000000000000000002a","salt":"9021","market_id":"0000000000000000000000000000000000000000000000000000000000000007","book_seq":"10452","order_id":"88131","side":"buy","price":350,"qty":"5"}}
+```
+
+### order\_rejected
+
+You receive it when a command is refused — by the gateway (funds, band, sanctions, session) or by the engine. One message answers all four command shapes; the identity fields are sentinel-disciplined, and which command was refused is recoverable from them: a nonzero `salt` means a `new_order` reject (or, under the all-zero `market_id`, a `cancel_all` reject); a nonzero `modify_seq` means a `modify_order` reject; neither means a `cancel_order` reject. A reject carries no `book_seq`.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | 40-hex | The account the session resolved for the command — who asked, never who owns |
+| `salt` | quoted `u64` | Echoed for `new_order` and `cancel_all` rejects; `"0"` for cancel/modify rejects |
+| `market_id` | 64-hex | The client's key echoed verbatim; the all-zero key only on a `cancel_all` reject (that command names no market) |
+| `order_id` | quoted `u64` | `"0"` when no order came to exist (an edge reject before id assignment); nonzero otherwise |
+| `modify_seq` | bare int | Nonzero exactly when the refused command was a `modify_order` |
+| `reason` | word | Closed set — `insufficient_funds`, `market_not_open`, `unknown_order`, `post_only_would_cross`, `unfilled` (an unfillable FOK — never booked), `stale_modify`, `wrong_account`, and the rest of the trading surface's reject vocabulary |
+
+```json
+{"version":9,"type":"order_rejected","ts_ms":"1787147719340","event_seq":"16","body":{"account":"000000000000000000000000000000000000002a","salt":"9034","market_id":"0000000000000000000000000000000000000000000000000000000000000007","order_id":"0","modify_seq":0,"reason":"insufficient_funds"}}
+```
+
+### fill
+
+You receive one per execution of your order, in the venue's YES frame. `(market_id, book_seq, fill_index)` is the globally unique fill identity — the dedup key, and the join key for the later `fill_settled`. No counterparty identity, by design.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | 40-hex | Your side's account |
+| `salt` | quoted `u64` | Your order's correlation label; `"0"` when unmapped |
+| `market_id` | 64-hex | The market key |
+| `book_seq` | quoted `u64` | The taker command's per-market sequence |
+| `fill_index` | bare int | Disambiguates the N fills one taker command produces, from `0` |
+| `order_id` | quoted `u64` | Your order in this fill |
+| `side` | word | Your order's side, `"buy"` or `"sell"` of YES |
+| `price` | bare int | Execution price in ticks — the maker's price |
+| `qty` | quoted `u64` | Lots filled |
+| `remaining` | quoted `u64` | Your order's remaining lots after this fill; `"0"` = filled out |
+| `liquidity` | word | `"maker"` or `"taker"` — your side of the trade |
+| `fee` | quoted `u64` | Total fee charged for this fill, micro-dollar base units. Makers pay `"0"`; takers pay the market's rate on this fill's price and quantity, floored to the fee grain with a one-grain minimum for any nonzero raw fee |
+| `position_yes` | quoted `u64` | Your gross YES lots in this market after the fill — absolute, never a delta |
+| `position_no` | quoted `u64` | Your gross NO lots after the fill — same absolute contract; both-nonzero is legal (the venue nets at settlement) |
+
+```json
+{"version":9,"type":"fill","ts_ms":"1787147712501","event_seq":"8","body":{"account":"000000000000000000000000000000000000002a","salt":"9021","market_id":"0000000000000000000000000000000000000000000000000000000000000007","book_seq":"10452","fill_index":0,"order_id":"88131","side":"buy","price":340,"qty":"2","remaining":"3","liquidity":"taker","fee":"4480","position_yes":"2","position_no":"0"}}
+```
+
+### cancel\_done
+
+You receive it when an order leaves the book with quantity released — terminal for the order. `remaining` is always at least 1: a cancel that raced its fill finds nothing resting and draws an `order_rejected` (`unknown_order`) instead.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | 40-hex | The cancelled order's account |
+| `market_id` | 64-hex | The market key |
+| `book_seq` | quoted `u64` | The cancelling command's per-market sequence |
+| `order_id` | quoted `u64` | The ended order |
+| `remaining` | quoted `u64` | Lots removed from the book — the released quantity, whatever the cause says |
+| `cause` | word | `requested` (your `cancel_order`/`cancel_all`), `ioc_residual` (an IOC/market order's unfilled remainder), `gtd_expired` (your expiry deadline fired), `self_trade` (self-trade prevention cancelled your resting order), or `session_lost` (the heartbeat deadman swept it — you did not ask) |
+
+```json
+{"version":9,"type":"cancel_done","ts_ms":"1787147718220","event_seq":"11","body":{"account":"000000000000000000000000000000000000002a","market_id":"0000000000000000000000000000000000000000000000000000000000000007","book_seq":"10471","order_id":"88131","remaining":"3","cause":"requested"}}
+```
+
+### modify\_done
+
+You receive it when a price modification applies: the order now rests at `new_price` with `remaining` quantity (always at least 1 — a filled-out order's modify rejects instead).
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | 40-hex | The modified order's account |
+| `market_id` | 64-hex | The market key |
+| `book_seq` | quoted `u64` | The modifying command's per-market sequence |
+| `order_id` | quoted `u64` | The modified order |
+| `modify_seq` | bare int | The applied modification's sequence — resume your own numbering strictly above it |
+| `new_price` | bare int | The order's new resting price in ticks |
+| `remaining` | quoted `u64` | The order's remaining lots — authoritative |
+
+```json
+{"version":9,"type":"modify_done","ts_ms":"1787147715080","event_seq":"10","body":{"account":"000000000000000000000000000000000000002a","market_id":"0000000000000000000000000000000000000000000000000000000000000007","book_seq":"10465","order_id":"88131","modify_seq":2,"new_price":355,"remaining":"3"}}
+```
+
+### order\_expired
+
+You receive it when the market-close sweep terminates the order — distinct from `cancel_done` so you can tell the venue closing the market from per-order outcomes. An order's own `expiry` deadline is not this frame: it terminates as `cancel_done` with cause `gtd_expired`.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | 40-hex | The expired order's account |
+| `market_id` | 64-hex | The market key |
+| `book_seq` | quoted `u64` | The close sweep's per-market sequence |
+| `order_id` | quoted `u64` | The ended order |
+| `remaining` | quoted `u64` | Lots released, always at least 1 |
+
+```json
+{"version":9,"type":"order_expired","ts_ms":"1787151600310","event_seq":"14","body":{"account":"000000000000000000000000000000000000002a","market_id":"0000000000000000000000000000000000000000000000000000000000000007","book_seq":"10530","order_id":"88900","remaining":"4"}}
+```
+
+### fill\_settled
+
+You receive it when the named fill's released money clears chain finality and moves `pending_finality` to `available`. Join it to the earlier `fill` on `(market_id, book_seq, fill_index)`. Fills settle in chain batches that finalize independently, so these arrive out of order across fills by design — never treat one as a watermark. The three amounts partition the money that moved; each may be `"0"`, and their sum is exactly what was promoted.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | 40-hex | The account whose money cleared finality |
+| `order_id` | quoted `u64` | Your order in that fill |
+| `market_id` | 64-hex | The market key |
+| `book_seq` | quoted `u64` | The fill identity's sequence |
+| `fill_index` | bare int | The fill identity's index |
+| `proceeds` | quoted `u64` | Net sale value of the fill's closing legs, base units — reconciles against position |
+| `price_improvement` | quoted `u64` | Lock taken at your limit, consumed at the better fill price, difference returned — reconciles against the order's lock |
+| `fee_refund` | quoted `u64` | Unused fee reserve returned — reconciles against the fee the `fill` event charged; makers release the entire reserve slice |
+
+```json
+{"version":9,"type":"fill_settled","ts_ms":"1787147712890","event_seq":"9","body":{"account":"000000000000000000000000000000000000002a","order_id":"88131","market_id":"0000000000000000000000000000000000000000000000000000000000000007","book_seq":"10452","fill_index":0,"proceeds":"0","price_improvement":"20000","fee_refund":"70"}}
+```
+
+### market\_settled
+
+You receive it when the market's settlement finalizes on chain — the terminal event for a market: your position payout and any of your fill releases still awaiting their own `fill_settled` land in `available` together. Sent only to affected accounts (payout or released nonzero). Outcome and price are venue-frame facts, never denormalized to your side.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | 40-hex | The addressed account — `payout` and `released` are its amounts |
+| `market_id` | 64-hex | The settled market |
+| `outcome` | word | `yes_won`, `no_won`, `void` (every lot redeems at the flat midpoint, 500,000 base units), or `at_price` |
+| `settle_price` | bare int | Final YES price in ticks, `1..=999` when `outcome` is `at_price`; exactly `0` otherwise |
+| `payout` | quoted `u64` | Position payout credited, base units; `"0"` is legal |
+| `released` | quoted `u64` | Pending fill releases swept to `available` by finality — fills whose `fill_settled` never arrived; `"0"` is legal |
+
+```json
+{"version":9,"type":"market_settled","ts_ms":"1787152201740","event_seq":"15","body":{"account":"000000000000000000000000000000000000002a","market_id":"0000000000000000000000000000000000000000000000000000000000000007","outcome":"yes_won","settle_price":0,"payout":"2000000","released":"0"}}
+```
+
+### market\_state
+
+You receive it when a market the account holds a position in transitions — `closed` (no more trading out) and `settled` (resolution determined; the payout itself is `market_settled`, at finality). An absolute restatement of the market's card: apply by monotone state per `market_id`, never by arrival — duplicates are routine and legal. The one event body with no `account` field (a venue fact); the envelope still carries the addressed account's `event_seq`.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `market_id` | 64-hex | The card's market |
+| `state` | word | `created`, `open`, `closed`, or `settled` — advances monotonically per market. `settled` means the resolution is determined; funds move at finality |
+| `tick_step` | bare int | The price-grid step in 0.1¢ ticks — a divisor of 1000 below it; `1` = full grid. A mid-life refinement rides a restated card of the same state |
+| `fee_rate_bps` | bare int | The market's taker-fee rate in basis points, `0..=1000`, set at creation and immutable; makers never pay |
+| `closes_at` | quoted `u64` | Advertised close, unix seconds; `"0"` = not announced. Advisory — gate order entry on `state`, never the clock |
+
+```json
+{"version":9,"type":"market_state","ts_ms":"1787151600280","event_seq":"13","body":{"market_id":"0000000000000000000000000000000000000000000000000000000000000007","state":"closed","tick_step":5,"fee_rate_bps":100,"closes_at":"1787151600"}}
+```
+
+### balance
+
+You receive it after every event that moves the account's money — always after the causing frame, never before it. Always the absolute three buckets, never a delta: apply by `balance_seq` alone, highest wins. The stamps are strictly increasing but not dense (one cause may collapse several ledger mutations into one frame), and a lost frame costs staleness, never correctness — the next one carries the whole truth.
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `account` | 40-hex | The account whose balances this restates |
+| `balance_seq` | quoted `u64` | The balance-state version — apply highest-wins against the trading snapshot's baseline stamp |
+| `available` | quoted `u64` | Spendable base units |
+| `locked` | quoted `u64` | Base units backing open orders |
+| `pending_finality` | quoted `u64` | Fill releases awaiting chain finality — visible, never at risk, spendable on the matching `fill_settled` or `market_settled` |
+
+```json
+{"version":9,"type":"balance","ts_ms":"1787147712520","event_seq":"12","body":{"account":"000000000000000000000000000000000000002a","balance_seq":"18","available":"48293710","locked":"1056930","pending_finality":"0"}}
+```
 
 ## Operator multiplexing
 
@@ -82,45 +372,34 @@ Operator-scope sessions hear nothing at connect and subscribe explicitly:
 {"version":9,"type":"listen","body":{"accounts":["000000000000000000000000000000000000002a","0000000000000000000000000000000000000063"]}}
 ```
 
-- `listen` and `unlisten` each name 1–10 distinct canonical addresses, judged
-  independently in frame order — one refused account never voids the others.
-  An empty, over-cap, or duplicate-carrying list refuses the frame shape as
-  `bad_request` `bad_account_batch`.
-- An admitted listen answers an **empty confirmation bracket**:
-  `snapshot_begin`, then `snapshot_end` naming the account with every count
-  `0` and `event_seq` `"0"`. The delivery tier restates no state and knows no
-  anchor — reconcile each account against the gateway's snapshot, exactly as
-  a client session would.
-- A refused account answers its own `listen_rejected`: `unknown_account` (the
-  address is not the canonical embedded form, so no event could ever route to
-  it) or `subscription_capacity` (the account's subscriber row is full — a
-  fixed number of sessions may watch one account at a time).
-- `unlisten` answers `unlisten_done`, also for a never-listened account — the
-  goal state holds. Unlistening never touches the heartbeat deadman.
-- Subscriptions are session state: a reconnect starts from zero and
-  re-listens.
+- `listen` and `unlisten` each name 1–10 distinct canonical addresses, judged independently in frame order — one refused account never voids the others. An empty, over-cap, or duplicate-carrying list refuses the frame shape as `bad_request` `bad_account_batch`.
+- An admitted listen answers an **empty confirmation bracket**: `snapshot_begin`, then `snapshot_end` naming the account with every count `0` and `event_seq` `"0"`. The delivery tier restates no state and knows no anchor — reconcile each account against the gateway's snapshot, exactly as a client session would.
+- A refused account answers its own `listen_rejected`: `unknown_account` (the address is not the canonical embedded form, so no event could ever route to it) or `subscription_capacity` (the account's subscriber row is full — a fixed number of sessions may watch one account at a time).
+- `unlisten` answers `unlisten_done`, also for a never-listened account — the goal state holds. Frames already queued behind the acknowledgement may still drain. Unlistening never touches the heartbeat deadman: an armed account stays armed until its window lapses or a disarming heartbeat lands.
+- Subscriptions are session state: a reconnect starts from zero and re-listens.
 - `listen` on a client-scope session answers `bad_request` `not_operator`.
 
 ## What this socket refuses
 
-Trading vocabulary has no meaning here. A session that sends `new_order`,
-`cancel_order`, `cancel_all`, `modify_order`, or `heartbeat` frames is a
-misdirected client and is **doomed** — the connection closes rather than
-half-serving a session pointed at the wrong endpoint. Commands are REST, on
-the trading surface; order protection is `POST /v1/heartbeat`, not this
-socket's liveness.
+Trading vocabulary has no meaning here. A session that sends `new_order`, `cancel_order`, `cancel_all`, `modify_order`, or `heartbeat` frames is a misdirected client and is **doomed** — the connection closes `1013` rather than half-serving a session pointed at the wrong endpoint. Commands are REST, on the trading surface; order protection is `POST /v1/heartbeat`, not this socket's liveness. Grammar, scope, and rate refusals are gentler: they answer `bad_request` in-band and keep the socket, as tabled above.
+
+## Connect refusals
+
+| Refusal | Meaning |
+| --- | --- |
+| HTTP `400` | A bad upgrade shape, or the socket already served an authenticated REST request — one socket, one transport session; upgrade on a fresh connection |
+| HTTP `404` | This host serves no WebSocket — you dialed a trading front; use the account-edge address |
+| Close `1013` right after auth | No session slot is free, or (client scope) the account's subscriber row is full — a session that would never receive events is refused rather than silently served. Back off and retry |
 
 ## Liveness and close behavior
 
 | Condition | Result |
 | --- | --- |
 | Normal peer or server shutdown | Close `1000` |
-| Token expires | Close `1008`; reconnect with a fresh token |
+| Token expires | Close `1008`; reconnect with a fresh token — no private frame is ever sent past the token boundary |
 | Liveness probes go unanswered | Close `1001` |
-| Egress backpressure (slow consumer) | Close `1013`; back off, reconnect, snapshot, splice |
-| Client payload exceeds the 587-byte frame cap | Close `1002` |
-| Trading vocabulary sent here | Connection doomed |
+| Egress backpressure (slow consumer) or ingress saturation | Close `1013`; back off, reconnect, snapshot, splice |
+| Client payload exceeds the 587-byte frame cap, unmasked data, or broken framing | Close `1002` |
+| Trading vocabulary sent here | Close `1013` (doomed) |
 
-The server pings a quiet session and closes after unanswered probes. Drain
-continuously, respond to pings, and treat every close as a
-snapshot-then-splice recovery event.
+The server pings a quiet session and closes `1001` after unanswered probes; any inbound frame resets the probe, and the standard automatic pong answers it. Drain continuously and treat every close as a snapshot-then-splice recovery event.
