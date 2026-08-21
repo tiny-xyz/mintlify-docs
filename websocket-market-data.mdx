@@ -4,46 +4,31 @@ description: "The relayed feed on /v1/stream: sub_ok anchors, absolute deltas, s
 icon: "chart-line"
 ---
 
-`GET /v1/stream` is the public, unauthenticated market-data stream served by
-edge boxes. The edge is a **relay**: it holds no book and serves no
-snapshot. A subscription answers a `sub_ok` splice anchor, then every feed
-update relays as one delta on a gapless connection sequence. Clients that
-need state fetch it from the history REST plane and splice the live stream
-above it.
+`GET /v1/stream` is the public, unauthenticated market-data stream served by edge boxes. The edge is a **relay**: it holds no book and serves no snapshot. A subscription answers a `sub_ok` splice anchor, then every feed update relays as one delta on a gapless connection sequence. Clients that need state fetch it from the history REST plane and splice the live stream above it.
 
 ```text
 wss://ws.tiny-testing.xyz/v1/stream
 ```
 
-This surface carries no account identities, order identities, authentication,
-or order entry.
+This surface carries no account identities, order identities, authentication, or order entry.
 
 ## Connect and subscribe
 
 <Steps>
   <Step title="Upgrade the exact route">
-    Open an RFC 6455 WebSocket to `/v1/stream`. Query strings, absolute-form
-    targets, request bodies, and alternate paths are refused.
+    Open an RFC 6455 WebSocket to `/v1/stream`. Query strings, absolute-form targets, request bodies, and alternate paths are refused.
   </Step>
   <Step title="Send subscriptions">
-    Follow the venue default market, pin up to eight explicit market IDs, or
-    both. Client messages are byte-exact canonical strings.
+    Follow the venue default market, pin up to eight explicit market IDs, or both. Client messages are byte-exact canonical strings.
   </Step>
   <Step title="Anchor on sub_ok">
-    Each subscription answers a `sub_ok` carrying the market's identity and
-    lifecycle card plus the stream coordinate `(epoch, update_seq)` the
-    stream is current through. It carries no book and no tape.
+    Each subscription answers a `sub_ok` carrying the market's identity and lifecycle card plus the stream coordinate `(epoch, update_seq)` the stream is current through. It carries no book and no tape.
   </Step>
   <Step title="Splice state from history">
-    For a rendered book, fetch `GET /v1/history/keyframe?market=M` and
-    `GET /v1/history/deltas?market=M&after=N`, then apply live deltas with
-    `update_seq` greater than your assembled coordinate. Tickers and tapes
-    that need no depth can skip this and render deltas directly.
+    For a rendered book, fetch `GET /v1/history/keyframe?market=M` and `GET /v1/history/deltas?market=M&after=N`, then apply live deltas with `update_seq` greater than your assembled coordinate. Tickers and tapes that need no depth can skip this and render deltas directly.
   </Step>
   <Step title="Enforce the connection sequence">
-    Every server message carries one quoted `seq`, starting at `"1"` and
-    shared by all markets on the connection. A gap means loss; the recovery
-    verb is re-sub plus re-splice.
+    Every server message carries one quoted `seq`, starting at `"1"` and shared by all markets on the connection. A gap means loss; the recovery verb is re-sub plus re-splice.
   </Step>
 </Steps>
 
@@ -53,29 +38,27 @@ The application vocabulary contains exactly four messages.
 
 | Exact payload | Effect |
 | --- | --- |
-| `{"type":"sub"}` | Follow the venue's default market; re-send for a fresh `sub_ok` anchor |
+| `{"type":"sub"}` | Follow the venue's default market; re-send for a fresh `sub_ok` anchor on the same sequence chain |
 | `{"type":"sub","market_id":"N"}` | Pin market `N`; re-send for a fresh anchor of that market |
-| `{"type":"unsub"}` | Clear the default follow and every explicit pin |
-| `{"type":"unsub","market_id":"N"}` | Remove only the explicit pin for market `N` |
+| `{"type":"unsub"}` | Clear the default follow and every explicit pin; a no-op while not subscribed — already-queued frames still drain |
+| `{"type":"unsub","market_id":"N"}` | Remove only the explicit pin for market `N`; a no-op if absent — the default follow and other pins are untouched |
 
-The payload must use fixed key order, no whitespace, and a canonical quoted
-decimal market ID: nonzero, no sign, no leading zeroes, and within `u32`.
-Anything else closes `1008`.
+The payload must use fixed key order, no whitespace, and a canonical quoted decimal market ID: nonzero, no sign, no leading zeroes, and within `u32`. Anything else closes `1008`.
 
-One connection may hold up to eight explicit market pins in addition to the
-default follow. A ninth distinct pin closes `1008`. Pinning an unannounced
-market is legal and answers a `sub_ok` with null card fields; content begins
-if the market is later announced.
+One connection may hold up to eight explicit market pins in addition to the default follow. A ninth distinct pin closes `1008`; the refusal stamps nothing — the sequence chain is untouched. Pinning an unannounced market is legal and answers a `sub_ok` with null card fields; content begins if the market is later announced.
 
-Inbound data must be masked and assemble to at most 64 bytes. Fragmentation
-is legal, but the complete assembled message remains subject to the same cap.
+### Control messages and rate limits
+
+- Inbound data must be masked and assemble to at most 64 payload bytes. Fragmentation is legal, but the complete assembled message remains subject to the same cap; over it closes `1009`.
+- Client pings are answered with pongs, payload echoed.
+- Client control messages are rate-limited, default 16 per second; over the limit closes `1013`.
+- Pongs draw their own higher allowance instead of that window — four times the control rate with a floor of 64 per second — so RFC 6455-legal unsolicited-pong keepalives and post-suspend pong bursts neither close a healthy socket nor crowd a re-sub out of the shared window. Only a genuine pong flood past that budget closes `1013`.
 
 ## Server-to-client messages
 
-Every application frame is an unfragmented text message carrying `type`,
-`seq` (the gapless connection-wide quoted `u64`), `epoch`, and `update_seq`.
+Every application frame is an unfragmented text message, one JSON object, one of exactly four types — `sub_ok`, `delta`, `stale`, `live` — carrying `type`, `seq` (the gapless connection-wide quoted `u64` from `"1"`), `epoch`, and `update_seq`. `epoch` and `update_seq` are `null` only before this edge has seen any feed frame.
 
-### sub_ok
+### sub\_ok
 
 The subscription acknowledgement and splice anchor:
 
@@ -91,48 +74,31 @@ The subscription acknowledgement and splice anchor:
 
 ### Delta kinds
 
-`type: "delta"` is discriminated by `kind`; every delta carries its own
-`market_id` — always key state by it.
+`type: "delta"` is discriminated by `kind`; every delta carries its own `market_id` — always key state by it.
 
 | Kind | Payload and application |
 | --- | --- |
-| `book` | `side`, `price`, `qty`, `orders`; overwrite the level's absolute state, deleting it when `qty` is `"0"` |
-| `trade` | `book_seq`, `fill_index`, `price`, `qty`, `taker_side`, `ts_ms`; deduplicate by `(book_seq, fill_index)` — keyframe sweeps restate recent prints |
-| `stats` | Replace the entire `stats` object |
-| `lifecycle` | Apply `state`, settlement fields, window stamps, and `tick_step` absolutely; a `null` value never erases a learned one |
-| `keyframe_begin` / `keyframe_end` | Bracket the producer's periodic full restatement of one market (paired by `keyframe_id`) |
+| `book` | `side` (`"bid"`/`"ask"`), `price`, `qty`, `orders`; overwrite the level's absolute state, deleting it when `qty` is `"0"` |
+| `trade` | `book_seq`, `fill_index`, `price`, `qty`, `taker_side` (`"buy"`/`"sell"` of YES), `ts_ms` (`"0"` = no stamp; display only); deduplicate by `(book_seq, fill_index)` — keyframe sweeps restate recent prints, and `book_seq` orders trades |
+| `stats` | Replace the entire `stats` object: `volume_tenths`, `open_interest`, `total_trades`, `unique_traders`, `last_price` (`null` before the first trade) |
+| `lifecycle` | Apply absolutely: `state`, `suspect`, `settled_outcome` (`"yes_won"`/`"no_won"`/`"void"`/`"settled_at_price"` or `null`), `settle_price` (non-null only for `settled_at_price`), `opened_at_ms`, `closes_at_ms` (advisory window stamps), `tick_step`; a `null` value never erases a learned one — it means the producer did not know |
+| `keyframe_begin` | `keyframe_id`: the producer opened its periodic full-restatement sweep for this market |
+| `keyframe_end` | `keyframe_id` (pairs the bracket), `level_count`, `trade_count`: the bracket closed — heal ghosts here |
 
-Lifecycle cards are venue-wide and can name a market other than any you
-serve — a predecessor's late settle beside the live successor. A mid-life
-grid refinement arrives as a same-state card carrying the finer `tick_step`.
+Lifecycle cards are venue-wide and can name a market other than any you serve — a predecessor's late settle beside the live successor. A mid-life grid refinement arrives as a same-state card carrying the finer `tick_step`.
 
-**Keyframe brackets:** inside a bracket, the sweep's level and trade
-restatements arrive as ordinary `book`/`trade` deltas. At `keyframe_end`, a
-stateful client deletes any held level of that market no delta touched inside
-the bracket — its delete was lost upstream. Clients holding no book ignore
-the brackets.
+**Keyframe brackets:** inside a bracket, the sweep's level and trade restatements arrive as ordinary `book`/`trade` deltas. At `keyframe_end`, a stateful client deletes any held level of that market no delta touched inside the bracket — its delete was lost upstream. Clients holding no book ignore the brackets.
 
 ### stale and live
 
-`type: "stale"` means served prices are not live: the upstream feed gapped,
-went quiet, or restarted. It is stream-scoped — flag every market the
-connection renders. `type: "live"` clears the flag after a complete keyframe
-sweep re-proves the stream. A fresh subscriber learns the current flag from
-`sub_ok.stale`. Prices are flagged, never frozen.
+`type: "stale"` means served prices are not live: the upstream feed gapped, went quiet, or restarted. It is stream-scoped — flag every market the connection renders. `type: "live"` clears the flag after a complete keyframe sweep re-proves the stream. A fresh subscriber learns the current flag from `sub_ok.stale`. Prices are flagged, never frozen.
 
 ## Coordinates and recovery
 
 Two sequence spaces exist; do not exchange them:
 
-- `seq` is per-connection delivery: gapless across all markets. A gap means
-  this connection lost frames — re-sub (fresh anchor, same chain) and
-  re-splice any held book.
-- `(epoch, update_seq)` is the venue-authored update coordinate: identical
-  across every edge box and the history rows, strictly increasing on the
-  deltas a connection receives but not dense per market. `epoch` is the feed
-  producer's incarnation — a producer restart advances it and re-bases
-  `update_seq`; never compare coordinates across epochs. On an epoch change,
-  refetch the keyframe and rebuild.
+- `seq` is per-connection delivery: gapless across all markets. A gap means this connection lost frames — re-sub (fresh anchor, same chain) and re-splice any held book.
+- `(epoch, update_seq)` is the venue-authored update coordinate: identical across every edge box and the history rows, strictly increasing on the deltas a connection receives but not dense per market. `epoch` is the feed producer's incarnation — a producer restart advances it and re-bases `update_seq`; never compare coordinates across epochs. On an epoch change, refetch the keyframe and rebuild.
 
 ## Units and safe parsing
 
@@ -144,39 +110,35 @@ Two sequence spaces exist; do not exchange them:
 | `market_id` | Quoted decimal identity, or `null` |
 | `volume_tenths` | Tenths-of-a-cent scale; multiply by 1,000 for trading-API micro-dollar units |
 
-`ts_ms`, `opened_at_ms`, `closes_at_ms`, and `now_ms` are display or advisory
-time. They never order market facts; `book_seq` orders trades.
+`ts_ms`, `opened_at_ms`, `closes_at_ms`, and `now_ms` are display or advisory time. They never order market facts; `book_seq` orders trades.
 
 ## Handshake refusals
 
 | HTTP result | Meaning |
 | --- | --- |
-| `400` | Smuggling-shaped request or invalid upgrade headers |
-| `404` | Target is not the exact `/v1/stream` origin-form path |
-| `431` | More than 32 headers or request head exceeds 4 KiB |
-| `503` | Retryable — connection slots, per-IP cap, or the readiness gate (no complete keyframe sweep seen yet; typically only the first seconds after an edge boots) |
+| `400` | A smuggling shape on an otherwise valid upgrade: any body, chunked transfer, or `Expect`. `Content-Length` is tolerated only as exactly one value of `0` — duplicates, conflicts, and unparseable values are `400` |
+| `404` | Anything but the exact origin-form `/v1/stream` target — any other path, any query string, or an absolute-form target |
+| `503` | Retryable — connection slots full, per-IP cap, handshake-population cap, or the readiness gate (no complete keyframe sweep of the current feed incarnation seen yet; typically only the first ~2 s after an edge boots). Back off about a second and retry |
 
-The complete upgrade head must arrive within roughly two seconds.
+Refusals are status-only. Two cases never produce a status line at all:
+
+- A head the WebSocket implementation itself refuses — a non-upgrade GET, any other method, missing or wrong upgrade headers, an oversized or malformed head — is dropped silently: the edge speaks WebSocket or nothing. The whole head must arrive within the head deadline (default 2 s) or the connection closes silently.
+- Pre-admission `503`s are best-effort: under a refusal flood the write is skipped and the socket simply drops. Retry either way.
 
 ## Close codes
 
 | Code | Meaning and recovery |
-| ---: | --- |
-| `1000` | Normal close or idle unsubscribed socket; reconnect if still needed |
-| `1001` | Liveness probe unanswered; the peer is presumed gone — reconnect |
-| `1002` | WebSocket protocol violation |
-| `1008` | Invalid application message or explicit pin limit exceeded |
+| --: | --- |
+| `1000` | Answering your close, or the idle deadline (default 10 s) on an upgraded-but-never-subscribed connection; reconnect if still needed |
+| `1001` | A liveness ping unanswered past the write-stall deadline; the peer is presumed gone — reconnect |
+| `1002` | WebSocket protocol violation: unmasked data, reserved bits, broken UTF-8 |
+| `1008` | Well-framed but unparseable application message, or a market sub past the eight-pin cap |
 | `1009` | Assembled data message exceeded 64 bytes |
 | `1011` | Internal encode failure; reconnect |
-| `1013` | Control-rate or egress overload; back off and reconnect |
+| `1013` | Too slow (egress overflow — the gapless backlog is fully delivered first) or over the control-message rate; back off and reconnect |
 
-Subscribed quiet sockets receive pings at roughly five-second cadence.
-Standard automatic pongs are sufficient. A peer that stops reading can be
-dropped after the write-stall deadline without receiving a close frame.
+Liveness: a subscribed socket that is quiet in both directions for about 5 s is sent an empty ping; the standard auto-pong — or any other frame — answers it. A probe unanswered past the write-stall deadline closes `1001`, so a subscribed peer that vanished without closing is reclaimed in roughly 15 s at the defaults. Unsubscribed sockets are never pinged — the idle deadline bounds them. A peer that stops reading entirely is dropped after the write-stall deadline (default 10 s) without receiving a close frame.
 
 ## Deliberate omissions
 
-The public stream contains no counterparty, account, or order identity; no
-authentication; no trading commands; no snapshots; and no complete market
-directory. State lives on the history REST plane; market discovery comes
-from lifecycle deltas or an off-exchange directory.
+The public stream contains no counterparty, account, or order identity; no authentication; no trading commands; no snapshots; and no complete market directory. State lives on the history REST plane; market discovery comes from lifecycle deltas or an off-exchange directory.
